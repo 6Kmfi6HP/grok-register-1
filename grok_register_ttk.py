@@ -68,6 +68,17 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "api_reverse_tools": "",
+    "cpa_export_enabled": False,
+    "cpa_auth_dir": "./cpa_auths",
+    "cpa_copy_to_hotload": False,
+    "cpa_hotload_dir": "",
+    "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+    "cpa_proxy": "",
+    "cpa_headless": False,
+    "cpa_force_standalone": True,
+    "cpa_mint_timeout_sec": 300,
+    "cpa_mint_cookie_inject": True,
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -2947,6 +2958,43 @@ return String(cfInput.value || '').trim().length;
     )
 
 
+
+def maybe_export_cpa_xai_after_success(email, password, sso="", log_callback=None, cancel_callback=None):
+    if not bool(config.get("cpa_export_enabled", False)):
+        return {"ok": False, "skipped": True, "reason": "disabled"}
+    logger = log_callback or (lambda message: None)
+    try:
+        from cpa_export import export_cpa_xai_for_account
+    except Exception as exc:
+        logger(f"[!] CPA 模块导入失败，已跳过 OIDC 导出: {exc}")
+        return {"ok": False, "error": str(exc)}
+    current_page = None
+    try:
+        current_page = page
+    except Exception:
+        current_page = None
+    try:
+        result = export_cpa_xai_for_account(
+            email=email,
+            password=password,
+            page=current_page,
+            sso=sso,
+            config=config,
+            log_callback=logger,
+            cancel_callback=cancel_callback,
+        )
+    except Exception as exc:
+        logger(f"[!] CPA OIDC 导出失败，账号已保留: {exc}")
+        return {"ok": False, "error": str(exc)}
+    if result.get("ok"):
+        exported_path = result.get("hotload_path") or result.get("path") or ""
+        suffix = f": {exported_path}" if exported_path else ""
+        logger(f"[+] CPA OIDC 导出成功{suffix}")
+    elif not result.get("skipped"):
+        logger(f"[!] CPA OIDC 导出失败，账号已保留: {result.get('error') or result}")
+    return result
+
+
 class GrokRegisterGUI:
     def __init__(self, root):
         self.root = root
@@ -3119,6 +3167,16 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
         add_field(self.grok2api_remote_key_entry, 11, 1, columnspan=3)
 
+        add_label(12, 0, "OIDC / CPA:")
+        self.cpa_export_var = tk.BooleanVar(value=bool(config.get("cpa_export_enabled", False)))
+        self.cpa_export_check = tk_checkbutton(config_frame, text="注册成功后导出 CPA xAI OIDC", variable=self.cpa_export_var)
+        add_field(self.cpa_export_check, 12, 1, sticky=tk.W)
+
+        add_label(12, 2, "CPA 输出目录:")
+        self.cpa_auth_dir_var = tk.StringVar(value=str(config.get("cpa_auth_dir", "./cpa_auths")))
+        self.cpa_auth_dir_entry = tk_entry(config_frame, textvariable=self.cpa_auth_dir_var, width=34)
+        add_field(self.cpa_auth_dir_entry, 12, 3)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -3211,6 +3269,8 @@ class GrokRegisterGUI:
         config["grok2api_auto_add_remote"] = bool(self.grok2api_remote_auto_var.get())
         config["grok2api_remote_base"] = self.grok2api_remote_base_var.get().strip()
         config["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
+        config["cpa_export_enabled"] = bool(self.cpa_export_var.get())
+        config["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip() or "./cpa_auths"
         raw_paths = [x.strip() for x in self.cloudflare_paths_var.get().split(",") if x.strip()]
         if len(raw_paths) >= 4:
             config["cloudflare_path_domains"] = raw_paths[0] if raw_paths[0].startswith("/") else ("/" + raw_paths[0])
@@ -3506,6 +3566,13 @@ def run_registration_cli(count):
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
+                maybe_export_cpa_xai_after_success(
+                    email=email,
+                    password=profile.get("password", ""),
+                    sso=sso,
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
+                )
                 success_count += 1
                 retry_count_for_slot = 0
                 i += 1

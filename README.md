@@ -53,6 +53,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - 支持验证码邮件轮询和解析。
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
+- 支持注册成功后可选导出 CLIProxyAPI 使用的 CPA xAI OAuth 凭证。
 - 支持注册后尝试开启 NSFW。
 - 支持页面卡住检测、当前账号重试、浏览器重启和内存清理。
 
@@ -112,6 +113,12 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+| `cpa_export_enabled` | 是否在 SSO 成功后额外导出 CPA xAI OIDC 凭证 |
+| `cpa_auth_dir` | 本地 CPA 导出目录，生成 `xai-*.json` |
+| `cpa_copy_to_hotload` | 是否额外复制到 CLIProxyAPI 的 auth-dir |
+| `cpa_hotload_dir` | CLIProxyAPI auth-dir 路径 |
+| `cpa_proxy` | CPA/OIDC 专用代理；留空则回退到 `proxy` |
+| `cpa_headless` | CPA/OIDC 浏览器是否无头，默认建议 `false` |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 
@@ -217,6 +224,33 @@ curl -X POST "https://你的-Cloud-Mail-域名/api/public/genToken" \
 
 `config.json` 包含个人配置和密钥，不要提交到 Git。
 
+### CPA / xAI OIDC 导出（可选）
+
+当 `cpa_export_enabled=true` 时，程序会在**账号已经注册成功、SSO 已保存**之后，额外发起一次 xAI Device Authorization，自动批准授权并导出 `xai-*.json`。
+
+这条线路是附加功能，不会替代原有的 SSO 保存流程。即使 OIDC 导出失败，原账号与 SSO 结果仍会保留。
+
+推荐最小配置：
+
+```json
+{
+  "cpa_export_enabled": true,
+  "cpa_auth_dir": "./cpa_auths",
+  "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+  "cpa_proxy": "",
+  "cpa_headless": false
+}
+```
+
+如需让 CLIProxyAPI 自动热加载，可额外填写：
+
+```json
+{
+  "cpa_copy_to_hotload": true,
+  "cpa_hotload_dir": "/path/to/cli-proxy-api/auth-dir"
+}
+```
+
 ## 运行
 
 ### CLI 模式
@@ -255,6 +289,8 @@ GUI 模式会打开 Tkinter 窗口，适合手动调整配置和观察日志。
 
 - `accounts_*.txt`：成功账号、密码和 SSO token。
 - `mail_credentials.txt`：临时邮箱凭证。
+- `cpa_auths/xai-*.json`：可选导出的 CPA xAI OAuth 凭证。
+- `cpa_auths/cpa_auth_failed.txt`：OIDC 导出失败记录。
 - `*.log`：可选日志文件。
 
 这些文件包含敏感信息，已被 `.gitignore` 忽略。
