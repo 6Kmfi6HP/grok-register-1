@@ -1,0 +1,26 @@
+name: Temporary refactor inventory
+
+on:
+  push:
+    paths:
+      - tools/build_refactor_inventory.py
+      - .github/workflows/temp-refactor-inventory.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  inventory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AST inventory
+        run: python tools/build_refactor_inventory.py
+      - name: Commit inventory
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add refactor_inventory.json
+          git commit -m "chore: generate temporary refactor inventory"
+          git push
