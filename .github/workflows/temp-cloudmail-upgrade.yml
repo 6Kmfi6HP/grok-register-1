@@ -21,6 +21,22 @@ jobs:
           ref: main
           fetch-depth: 0
 
+      - name: Fix Cloud Mail patch generator escaping
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          path = Path("tools/apply_cloudmail_upgrade.py")
+          text = path.read_text(encoding="utf-8")
+          old = '            combined = "\\n".join(parts)'
+          new = '            combined = "\\\\n".join(parts)'
+          count = text.count(old)
+          if count != 1:
+              raise RuntimeError(f"newline escape fix: expected exactly one match, found {count}")
+          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          PY
+
       - name: Apply Cloud Mail provider patch
         run: python tools/apply_cloudmail_upgrade.py
 
