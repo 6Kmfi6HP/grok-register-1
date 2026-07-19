@@ -12,8 +12,22 @@ import urllib.request
 from pathlib import Path
 from typing import Callable, Optional
 
-_ROOT = Path(__file__).resolve().parent
-_DEFAULT_AUTH_DIR = _ROOT / "cpa_auths"
+from app_paths import default_cpa_auth_dir, get_app_root, get_resource_root
+
+
+def _writable_root() -> Path:
+    """User-writable project root (next to exe when frozen)."""
+    return Path(get_app_root())
+
+
+def _bundle_root() -> Path:
+    """Read-only resource root for bundled package code."""
+    return Path(get_resource_root())
+
+
+# Back-compat aliases for any external imports of these names.
+_ROOT = _writable_root()
+_DEFAULT_AUTH_DIR = Path(default_cpa_auth_dir())
 
 
 @dataclass(frozen=True)
@@ -38,13 +52,14 @@ class CpaExportSettings:
     @classmethod
     def from_config(cls, config):
         cfg = dict(config or {})
-        auth_dir = Path(cfg.get("cpa_auth_dir") or _DEFAULT_AUTH_DIR).expanduser()
+        root = _writable_root()
+        auth_dir = Path(cfg.get("cpa_auth_dir") or default_cpa_auth_dir()).expanduser()
         if not auth_dir.is_absolute():
-            auth_dir = (_ROOT / auth_dir).resolve()
+            auth_dir = (root / auth_dir).resolve()
         hotload_value = str(cfg.get("cpa_hotload_dir") or "").strip()
         hotload_dir = Path(hotload_value).expanduser() if hotload_value else None
         if hotload_dir is not None and not hotload_dir.is_absolute():
-            hotload_dir = (_ROOT / hotload_dir).resolve()
+            hotload_dir = (root / hotload_dir).resolve()
         management_key = str(
             cfg.get("cpa_management_key") or cfg.get("cpa_api_key") or ""
         ).strip()
@@ -124,7 +139,10 @@ def _load_mint_and_export(tools_dir=""):
     tools = Path(tools_value).expanduser().resolve()
     package = tools if tools.name == "cpa_xai" else tools / "cpa_xai"
     init_path = package / "__init__.py"
-    if package.resolve() == (_ROOT / "cpa_xai").resolve():
+    if package.resolve() in {
+        (_bundle_root() / "cpa_xai").resolve(),
+        (_writable_root() / "cpa_xai").resolve(),
+    }:
         from cpa_xai import mint_and_export
         return mint_and_export
     if not init_path.is_file():

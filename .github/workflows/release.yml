@@ -1,0 +1,262 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label for dry-run artifact names (without requiring a tag)"
+        required: false
+        default: "dev"
+      publish:
+        description: "Upload artifacts to a GitHub Release (only when running on a v* tag)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+  build-windows:
+    name: Build Windows x64
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            RAW="${{ github.ref_name }}"
+          else
+            RAW="${{ github.event.inputs.version || 'dev' }}"
+          fi
+          RAW="${RAW#v}"
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RAW" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: v$RAW"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Build package
+        shell: pwsh
+        env:
+          GROK_REGISTER_VERSION: v${{ steps.ver.outputs.version }}
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1 -Version "v${{ steps.ver.outputs.version }}"
+
+      - name: Verify artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          ART="dist/grok-register-v${{ steps.ver.outputs.version }}-windows-x64.zip"
+          test -f "$ART"
+          SIZE=$(wc -c < "$ART" | tr -d ' ')
+          echo "Artifact size: $SIZE bytes"
+          test "$SIZE" -gt 1000000
+          # Secret scan inside zip
+          python - <<'PY'
+          import sys, zipfile
+          from pathlib import Path
+          art = Path(r"dist/grok-register-v${{ steps.ver.outputs.version }}-windows-x64.zip")
+          bad = []
+          with zipfile.ZipFile(art) as zf:
+              names = zf.namelist()
+              for name in names:
+                  base = name.rstrip("/").split("/")[-1]
+                  lower = name.replace("\\", "/").lower()
+                  if base == "config.json":
+                      bad.append(name)
+                  if base.startswith("accounts_") and base.endswith(".txt"):
+                      bad.append(name)
+                  if base == "mail_credentials.txt":
+                      bad.append(name)
+                  if "/cpa_auths/" in lower and not name.endswith("/"):
+                      bad.append(name)
+                  if base.endswith(".pending.jsonl"):
+                      bad.append(name)
+          if bad:
+              print("Secret-like paths in artifact:", bad, file=sys.stderr)
+              sys.exit(1)
+          print("Secret scan OK (%d entries)" % len(names))
+          PY
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-register-v${{ steps.ver.outputs.version }}-windows-x64
+          path: dist/grok-register-v${{ steps.ver.outputs.version }}-windows-x64.zip
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux x64 (optional)
+    needs: test
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            RAW="${{ github.ref_name }}"
+          else
+            RAW="${{ github.event.inputs.version || 'dev' }}"
+          fi
+          RAW="${RAW#v}"
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install system deps for Tk / zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip libtk8.6 || sudo apt-get install -y zip tk-dev
+
+      - name: Build package
+        env:
+          GROK_REGISTER_VERSION: v${{ steps.ver.outputs.version }}
+        run: |
+          chmod +x scripts/build.sh
+          ./scripts/build.sh "v${{ steps.ver.outputs.version }}"
+
+      - name: Verify artifact
+        run: |
+          set -euo pipefail
+          ART="dist/grok-register-v${{ steps.ver.outputs.version }}-linux-x64.zip"
+          # uname -m on GitHub ubuntu is x86_64 -> x64
+          if [[ ! -f "$ART" ]]; then
+            ls -la dist || true
+            # accept arm label only if present
+            ART=$(ls dist/grok-register-v${{ steps.ver.outputs.version }}-linux-*.zip | head -n1)
+          fi
+          test -f "$ART"
+          SIZE=$(wc -c < "$ART" | tr -d ' ')
+          echo "Artifact: $ART ($SIZE bytes)"
+          test "$SIZE" -gt 1000000
+          echo "ART_PATH=$ART" >> "$GITHUB_ENV"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grok-register-v${{ steps.ver.outputs.version }}-linux-x64
+          path: dist/grok-register-v${{ steps.ver.outputs.version }}-linux-*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' || (github.event_name == 'workflow_dispatch' && inputs.publish == true && startsWith(github.ref, 'refs/tags/v'))
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            RAW="${{ github.ref_name }}"
+          else
+            RAW="${{ github.ref_name }}"
+          fi
+          RAW="${RAW#v}"
+          echo "version=$RAW" >> "$GITHUB_OUTPUT"
+          echo "tag=v$RAW" >> "$GITHUB_OUTPUT"
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-register-v${{ steps.ver.outputs.version }}-windows-x64
+          path: release-assets
+
+      - name: Download Linux artifact (optional)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: grok-register-v${{ steps.ver.outputs.version }}-linux-x64
+          path: release-assets
+
+      - name: List assets
+        run: |
+          ls -la release-assets
+          test -n "$(ls -A release-assets)"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## 下载与安装
+
+            ### Windows x64（主分发）
+            1. 下载 `grok-register-v${{ steps.ver.outputs.version }}-windows-x64.zip`
+            2. 解压到任意目录
+            3. 将同目录下的 `config.example.json` 复制为 `config.json` 并填写密钥
+            4. 双击 `grok-register.exe` 或 `start-gui.bat` 启动 GUI
+            5. CLI 示例：
+               - `grok-register.exe cli`
+               - `grok-register.exe start 5`
+               - `grok-register.exe retry-pending accounts_xxx.txt.pending.jsonl`
+
+            ### 浏览器要求
+            本包**不内置** Chrome 浏览器二进制。请先安装 **Google Chrome** 或 **Chromium**，CloakBrowser 会使用系统浏览器内核。
+
+            ### 配置与数据位置
+            `config.json`、`accounts_*.txt`、`mail_credentials.txt`、`cpa_auths/` 均写在**可执行文件同目录**（用户可写），不会写入只读解压目录。
+
+            ### 说明
+            - 本项目仅用于自动化流程研究、测试环境验证和个人学习。
+            - 未做代码签名；Windows SmartScreen / 杀毒软件可能误报，请从本 GitHub Release 校验来源。
+          files: release-assets/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

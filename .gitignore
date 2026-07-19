@@ -31,3 +31,17 @@ screenshots/
 
 *.pending.jsonl
 *.pending.jsonl.lock
+
+# Packaging / PyInstaller outputs (never commit binaries)
+build/
+dist/
+*.spec.bak
+*.manifest
+warn-*.txt
+# Keep the checked-in packaging spec; ignore accidental local clones
+# (grok-register.spec is tracked)
+
+# Local packaging scratch
+release-assets/
+*.zip
+!assets/**

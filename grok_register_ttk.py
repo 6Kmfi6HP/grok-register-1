@@ -109,6 +109,9 @@ def log_exception(context, exc, log_callback=None):
 
 
 def ensure_stable_python_runtime():
+    # Frozen binaries must not re-exec into a system Python interpreter.
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return
     if sys.version_info < (3, 14) or os.environ.get("DPE_REEXEC_DONE") == "1":
         return
 
@@ -134,6 +137,8 @@ def ensure_stable_python_runtime():
 
 
 def warn_runtime_compatibility():
+    if getattr(sys, "frozen", False) or hasattr(sys, "_MEIPASS"):
+        return
     if sys.version_info >= (3, 14):
         print(
             "[提示] 当前 Python 为 3.14+；若出现 Mail.tm TLS 异常，建议改用 Python 3.12 或 3.13。"
@@ -143,9 +148,17 @@ def warn_runtime_compatibility():
 ensure_stable_python_runtime()
 warn_runtime_compatibility()
 
-EXTENSION_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "turnstilePatch")
+from app_paths import (  # noqa: E402
+    default_accounts_path,
+    default_mail_credentials_dir,
+    ensure_user_data_layout,
+    program_name,
+    resolve_version,
+    resource_path,
 )
+
+# Extension lives in the bundle resource tree (read-only when frozen).
+EXTENSION_PATH = os.path.abspath(resource_path("turnstilePatch"))
 
 
 
@@ -615,7 +628,7 @@ def maybe_export_cpa_xai_after_success(email, password, sso="", log_callback=Non
 def _save_mail_credential(email, credential, log_callback=None):
     from account_outputs import save_mail_credential
     try:
-        return save_mail_credential(os.path.dirname(__file__), email, credential)
+        return save_mail_credential(default_mail_credentials_dir(), email, credential)
     except Exception as exc:
         log_exception("保存邮箱凭据失败", exc, log_callback)
         return False
@@ -1019,9 +1032,7 @@ class GrokRegisterGUI:
         self._reset_batch_counters()
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
-        )
+        self.accounts_output_file = default_accounts_path(now)
         self.update_stats()
         self._set_running_ui(True)
         self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
@@ -1085,9 +1096,8 @@ def cli_log(message):
 
 def run_registration_cli(count, worker_count=1):
     controller = CliStopController()
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+    accounts_output_file = default_accounts_path(
+        datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     )
     threads = max(1, min(int(worker_count or 1), int(count), 10))
     cli_log(f"[*] 终端模式启动，目标数量: {count}，并发线程: {threads}")
@@ -1232,10 +1242,41 @@ def main_cli(argv=None):
     run_registration_cli(count, worker_count=threads)
 
 
+def _print_help():
+    prog = program_name()
+    print(
+        f"""Grok Register {resolve_version()}
+
+用法:
+  {prog}                  启动 GUI（默认）
+  {prog} cli [数量]       CLI 模式（输入 start 后开始）
+  {prog} start [数量]     同 cli
+  {prog} --cli [数量]     同 cli
+  {prog} retry-pending <pending文件> [输出文件]
+  {prog} --help           显示本帮助
+  {prog} --version        显示版本
+
+打包版说明:
+  - 配置与账号输出写在可执行文件同目录（用户可写），不会写入只读的运行时解压目录。
+  - 首次使用请将 config.example.json 复制为 config.json 并填写密钥。
+  - 浏览器依赖系统已安装的 Google Chrome / Chromium。
+"""
+    )
+
+
 def main():
+    ensure_user_data_layout()
+    if len(sys.argv) > 1:
+        arg0 = sys.argv[1].strip().lower()
+        if arg0 in ("-h", "--help", "help"):
+            _print_help()
+            return
+        if arg0 in ("-v", "--version", "version"):
+            print(resolve_version())
+            return
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() == "retry-pending":
         if len(sys.argv) < 3:
-            print("用法: python grok_register_ttk.py retry-pending <pending文件> [输出文件]", file=sys.stderr)
+            print(f"用法: {program_name()} retry-pending <pending文件> [输出文件]", file=sys.stderr)
             return
         try:
             summary = retry_pending_file(
@@ -1254,7 +1295,7 @@ def main():
         return
     if not TK_AVAILABLE:
         print(f"[!] GUI 模式需要 Tkinter，但当前环境不可用: {TK_IMPORT_ERROR}", file=sys.stderr)
-        print("[*] 可改用 CLI 模式: python grok_register_ttk.py cli", file=sys.stderr)
+        print(f"[*] 可改用 CLI 模式: {program_name()} cli", file=sys.stderr)
         return
     root = tk.Tk()
     setup_light_theme(root)

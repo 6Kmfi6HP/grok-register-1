@@ -4,7 +4,10 @@ import os
 import tempfile
 import urllib.parse
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+from app_paths import default_config_path, ensure_user_data_layout
+
+# Writable config path: next to the executable when frozen, source root in dev.
+CONFIG_FILE = default_config_path()
 
 DEFAULT_CONFIG = {
     "duckmail_api_key": "",
@@ -184,6 +187,7 @@ def _replace_config(value):
 
 
 def load_config():
+    ensure_user_data_layout()
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as handle:
@@ -197,6 +201,7 @@ def load_config():
 
 
 def save_config():
+    ensure_user_data_layout()
     normalized = validate_config_structure(config)
     _replace_config(normalized)
     config_dir = os.path.dirname(os.path.abspath(CONFIG_FILE))

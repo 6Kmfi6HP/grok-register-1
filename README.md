@@ -35,6 +35,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 - [当前功能](#当前功能)
 - [运行流程](#运行流程)
 - [环境要求](#环境要求)
+- [下载与安装](#下载与安装)
 - [安装](#安装)
 - [配置](#配置)
 - [运行方式](#运行方式)
@@ -86,10 +87,66 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 
 ## 环境要求
 
-- Python **3.9+**
-- Google Chrome 或 Chromium
+- Python **3.9+**（从源码运行时）
+- Google Chrome 或 Chromium（**打包版与源码版均需要**；发行包不内置浏览器二进制）
 - 可访问注册页面和所选邮箱 API 的网络环境
 - GUI 模式需要 Tkinter；没有 Tkinter 时可使用 CLI 模式
+
+## 下载与安装
+
+无需安装 Python 时，可从 GitHub Releases 下载预构建包：
+
+**[Releases](https://github.com/AaronL725/grok-register/releases)**
+
+### 选择资源
+
+| 资源名 | 平台 | 说明 |
+| --- | --- | --- |
+| `grok-register-vX.Y.Z-windows-x64.zip` | Windows x64 | **主分发**；解压即用 |
+| `grok-register-vX.Y.Z-linux-x64.zip` | Linux x64 | 可选；视 CI 是否成功构建 |
+
+macOS 预构建暂未作为稳定目标；如需可从源码运行或本地打包。
+
+### Windows（推荐）
+
+1. 安装 [Google Chrome](https://www.google.com/chrome/) 或 Chromium。
+2. 下载 `grok-register-v*-windows-x64.zip` 并解压到任意目录（例如 `D:\tools\grok-register\`）。
+3. 将同目录下的 `config.example.json` 复制为 `config.json`，按需填写 API Key / 邮箱等配置。
+4. 启动 GUI：
+   - 双击 `grok-register.exe`，或
+   - 双击 `start-gui.bat`
+5. CLI 示例（在解压目录打开终端）：
+
+```bat
+grok-register.exe --help
+grok-register.exe --version
+grok-register.exe cli
+grok-register.exe start 5
+grok-register.exe retry-pending accounts_20260101_120000.txt.pending.jsonl
+```
+
+### 配置与数据位置（打包版）
+
+以下文件写在**可执行文件同目录**（用户可写），不会写入只读的运行时解压目录（`_MEIPASS` / `_internal`）：
+
+- `config.json`
+- `accounts_*.txt` 与 `*.pending.jsonl`
+- `mail_credentials.txt`
+- `cpa_auths/`
+- 默认 `token.json`（未在配置中另行指定时）
+
+首次运行若尚无 `config.json`，程序会使用内置默认配置启动 GUI；正式跑注册前请先保存有效配置。发行包内只附带 `config.example.json` 模板，**从不包含真实密钥、账号或 CPA 凭证**。
+
+### 浏览器说明
+
+打包策略优先保证可运行，而非塞进数百 MB 的浏览器二进制：
+
+- 运行时通过 CloakBrowser / Playwright 使用**系统已安装的 Chrome / Chromium**
+- 若启动浏览器失败，请确认 Chrome 已安装且可从开始菜单正常打开
+
+### 从源码安装
+
+若需要修改代码或开发调试，请继续阅读下一节「安装」。
 
 ## 安装
 

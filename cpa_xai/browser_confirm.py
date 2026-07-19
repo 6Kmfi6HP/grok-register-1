@@ -29,7 +29,11 @@ from .browser_session import (
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    try:
+        from app_paths import get_app_root
+        return Path(get_app_root())
+    except Exception:
+        return Path(__file__).resolve().parents[1]
 
 
 def _debug_shot_dir() -> Path:

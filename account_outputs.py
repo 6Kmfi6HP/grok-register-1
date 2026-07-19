@@ -162,7 +162,8 @@ def resolve_grok2api_local_token_file():
     configured = str(config.get("grok2api_local_token_file", "") or "").strip()
     if configured:
         return configured
-    return os.path.join(os.path.dirname(__file__), "token.json")
+    from app_paths import default_token_path
+    return default_token_path()
 
 def _normalize_sso_token(raw_token):
     token = str(raw_token or "").strip()
