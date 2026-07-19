@@ -103,11 +103,11 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 | 资源名 | 平台 | 说明 |
 | --- | --- | --- |
 | `grok-register-vX.Y.Z-windows-x64.zip` | Windows x64 | **主分发**；解压即用 |
-| `grok-register-vX.Y.Z-macos-arm64.zip` | macOS Apple Silicon (M 系列) | CI 构建；未代码签名 |
-| `grok-register-vX.Y.Z-macos-x64.zip` | macOS Intel | CI 构建；未代码签名 |
+| `grok-register-vX.Y.Z-macos-arm64.zip` | macOS Apple Silicon (M 系列) | CI 主构建；未代码签名 |
+| `grok-register-vX.Y.Z-macos-x64.zip` | macOS Intel | best-effort（GitHub Intel runner 可能排队/缺失）；也可本机 `./scripts/build.sh` |
 | `grok-register-vX.Y.Z-linux-x64.zip` | Linux x64 | 可选；视 CI 是否成功构建 |
 
-可用 `uname -m` 判断本机架构：`arm64` 选 macOS arm64，`x86_64` 选 macOS x64。
+可用 `uname -m` 判断本机架构：`arm64` 选 macOS arm64，`x86_64` 选 macOS x64（或本地打包）。
 
 ### Windows（推荐）
 
