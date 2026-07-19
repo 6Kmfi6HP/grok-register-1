@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from cpa_xai.mint import mint_and_export
-from cpa_xai.schema import build_cpa_xai_auth, jwt_payload
+from cpa_xai.schema import DEFAULT_CLIENT_HEADERS, build_cpa_xai_auth, jwt_payload
 from cpa_xai.writer import write_cpa_xai_auth
 
 
@@ -16,6 +16,19 @@ class CpaCoreTests(unittest.TestCase):
             build_cpa_xai_auth("a@example.com", "", "refresh")
         with self.assertRaises(ValueError):
             jwt_payload("not-a-jwt")
+
+    def test_schema_includes_default_client_headers(self):
+        # Minimal fake JWT payload segments are not needed; identity parse fails soft.
+        payload = build_cpa_xai_auth(
+            "a@example.com",
+            "access-token",
+            "refresh-token",
+        )
+        self.assertEqual(payload["headers"], DEFAULT_CLIENT_HEADERS)
+        self.assertEqual(
+            payload["headers"]["x-xai-token-auth"],
+            "xai-grok-cli",
+        )
 
     def test_writer_failure_does_not_leave_temp_file(self):
         with tempfile.TemporaryDirectory() as directory:

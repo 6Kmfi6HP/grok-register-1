@@ -10,6 +10,15 @@ DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 DEFAULT_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 DEFAULT_REDIRECT_URI = "http://127.0.0.1:56121/callback"
 
+# CLIProxyAPI / grok-shell client headers required by cli-chat-proxy
+DEFAULT_CLIENT_HEADERS = {
+    "User-Agent": "grok-shell/0.2.93 (linux; x86_64)",
+    "x-authenticateresponse": "authenticate-response",
+    "x-grok-client-identifier": "grok-shell",
+    "x-grok-client-version": "0.2.93",
+    "x-xai-token-auth": "xai-grok-cli",
+}
+
 
 def _sanitize_file_segment(value):
     text = str(value or "").strip()
@@ -68,6 +77,7 @@ def build_cpa_xai_auth(
     base_url=DEFAULT_BASE_URL,
     token_endpoint=DEFAULT_TOKEN_ENDPOINT,
     redirect_uri=DEFAULT_REDIRECT_URI,
+    headers=None,
 ):
     access = str(access_token or "").strip()
     refresh = str(refresh_token or "").strip()
@@ -103,6 +113,7 @@ def build_cpa_xai_auth(
         "redirect_uri": str(redirect_uri or DEFAULT_REDIRECT_URI).strip(),
         "token_endpoint": str(token_endpoint or DEFAULT_TOKEN_ENDPOINT).strip(),
         "auth_kind": "oauth",
+        "headers": dict(headers or DEFAULT_CLIENT_HEADERS),
     }
     if id_token:
         payload["id_token"] = str(id_token).strip()
