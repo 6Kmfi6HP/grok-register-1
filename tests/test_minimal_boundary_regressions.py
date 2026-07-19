@@ -55,36 +55,52 @@ class MinimalBoundaryRegressionTests(unittest.TestCase):
         logs = logs if logs is not None else []
         return RegistrationCallbacks(log=logs.append, cancelled=lambda: False)
 
-    def test_cpa_copy_failure_is_partial_warning_and_batch_warning(self):
+    def test_cpa_remote_upload_is_invoked_when_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
+            auth_path = Path(directory) / "xai-user@example.com.json"
+            auth_path.write_text('{"type":"xai","email":"user@example.com"}\n', encoding="utf-8")
             config = {
                 "cpa_export_enabled": True,
                 "cpa_auth_dir": directory,
-                "cpa_copy_to_hotload": True,
-                "cpa_hotload_dir": str(Path(directory) / "hotload"),
+                "cpa_auto_upload_remote": True,
+                "cpa_remote_base": "http://127.0.0.1:8327",
+                "cpa_management_key": "test-key",
             }
-            mint = lambda **kwargs: {"ok": True, "path": str(Path(directory) / "xai-test.json")}
+            mint = lambda **kwargs: {"ok": True, "path": str(auth_path)}
+            remote = {"ok": True, "remote": "http://127.0.0.1:8327", "name": auth_path.name}
             with patch.object(cpa_export, "_load_mint_and_export", return_value=mint), \
-                 patch.object(cpa_export.shutil, "copy2", side_effect=OSError("copy failed")):
+                 patch.object(cpa_export, "upload_auth_to_remote_cpa", return_value=remote) as upload:
+                result = cpa_export.export_cpa_xai_for_account("user@example.com", "pw", config=config)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["remote_upload"], remote)
+            upload.assert_called_once()
+            kwargs = upload.call_args.kwargs
+            self.assertEqual(kwargs["remote_base"], "http://127.0.0.1:8327")
+            self.assertEqual(kwargs["management_key"], "test-key")
+
+    def test_cpa_remote_upload_failure_is_partial_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            auth_path = Path(directory) / "xai-user@example.com.json"
+            auth_path.write_text('{"type":"xai"}\n', encoding="utf-8")
+            config = {
+                "cpa_export_enabled": True,
+                "cpa_auth_dir": directory,
+                "cpa_auto_upload_remote": True,
+                "cpa_remote_base": "http://127.0.0.1:8327",
+                "cpa_management_key": "test-key",
+            }
+            mint = lambda **kwargs: {"ok": True, "path": str(auth_path)}
+            with patch.object(cpa_export, "_load_mint_and_export", return_value=mint), \
+                 patch.object(
+                     cpa_export,
+                     "upload_auth_to_remote_cpa",
+                     return_value={"ok": False, "error": "connection refused"},
+                 ):
                 result = cpa_export.export_cpa_xai_for_account("user@example.com", "pw", config=config)
             self.assertTrue(result["ok"])
             self.assertTrue(result["warning"])
             self.assertTrue(result["partial"])
-            self.assertIn("copy failed", result["cpa_copy_error"])
-
-        batch = run_batch(
-            1,
-            self.callbacks(),
-            lambda *args: None,
-            make_ops(export_cpa=lambda *args: {
-                "ok": True,
-                "warning": True,
-                "partial": True,
-                "cpa_copy_error": "copy failed",
-            }),
-        )
-        self.assertEqual(batch.success_count, 1)
-        self.assertEqual(batch.postprocess_warning_count, 1)
+            self.assertIn("connection refused", result["remote_upload_error"])
 
     def test_duckmail_retries_same_message_after_detail_failure(self):
         message = {"id": "m1", "to": [{"address": "user@example.com"}]}

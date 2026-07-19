@@ -167,17 +167,74 @@ def _find_button_exact(page: Any, label: str) -> Optional[Any]:
 def _cookie_banner_visible(text: str) -> bool:
     source = text or ""
     lower = source.lower()
+    # Require concrete cookie-banner CTAs. Bare "cookie" false-positives on consent
+    # copy and blocks the Allow click forever.
     return any(
         needle in source or needle in lower
-        for needle in ("全部允许", "隐私偏好", "cookie", "privacy preference", "allow all")
+        for needle in (
+            "全部允许",
+            "隐私偏好",
+            "accept all cookies",
+            "reject all",
+            "allow all",
+            "cookies settings",
+            "preference center",
+        )
+    )
+
+
+def _is_cookie_banner_label(label: str) -> bool:
+    text = re.sub(r"\s+", "", str(label or "")).lower()
+    return any(
+        needle in text
+        for needle in (
+            "全部允许",
+            "acceptallcookies",
+            "allowall",
+            "rejectall",
+            "cookiessettings",
+            "privacypreference",
+            "preferencecenter",
+        )
     )
 
 
 def _dismiss_cookie_banner(page: Any, log: LogFn) -> bool:
-    for label in ("全部允许", "Allow all", "接受", "Accept"):
+    for label in (
+        "Accept All Cookies",
+        "全部允许",
+        "Allow all",
+        "Allow All",
+        "接受全部",
+        "Reject All",
+        "接受",
+        "Accept",
+    ):
         if _click_exact(page, [label], log, real=True):
             log("cookie banner dismissed: %s" % label)
             return True
+    try:
+        clicked = page.run_js(
+            """
+            const nodes = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+            const normalize = (node) => (node.innerText || node.textContent || node.value || node.getAttribute('aria-label') || '')
+              .replace(/\\s+/g, ' ').trim().toLowerCase();
+            const preferred = ['accept all cookies', 'allow all', '全部允许', '接受全部', 'reject all'];
+            for (const want of preferred) {
+              const target = nodes.find((node) => {
+                const text = normalize(node);
+                return text === want || text.includes(want);
+              });
+              if (target) { target.click(); return (target.innerText || target.textContent || want).trim(); }
+            }
+            return '';
+            """
+        )
+        if clicked:
+            log("cookie banner dismissed: %s" % clicked)
+            return True
+    except Exception as exc:
+        log("cookie banner js dismiss failed: %s" % exc)
     return False
 
 
@@ -187,6 +244,13 @@ def _click_exact(page: Any, labels, log: LogFn, real: bool = False) -> Optional[
         if not target:
             continue
         try:
+            target_text = ""
+            try:
+                target_text = str(getattr(target, "text", "") or "")
+            except Exception:
+                target_text = ""
+            if label in ("Allow", "允许", "Authorize", "Approve") and _is_cookie_banner_label(target_text):
+                continue
             if real:
                 target.click()
             else:
@@ -199,6 +263,73 @@ def _click_exact(page: Any, labels, log: LogFn, real: bool = False) -> Optional[
         except Exception as exc:
             log("button click failed %s: %s" % (label, exc))
     return None
+
+
+def _click_consent_allow(page: Any, log: LogFn) -> bool:
+    if _click_exact(page, ["允许", "Allow", "Authorize", "Approve"], log, real=True):
+        return True
+    try:
+        clicked = page.run_js(
+            """
+            function textOf(node) {
+              return [
+                node.innerText,
+                node.textContent,
+                node.getAttribute('aria-label'),
+                node.getAttribute('title'),
+                node.getAttribute('value'),
+              ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+            }
+            function isCookieUi(text) {
+              const t = text.replace(/\\s+/g, '').toLowerCase();
+              return (
+                t.includes('acceptallcookies') ||
+                t.includes('allowall') ||
+                t.includes('rejectall') ||
+                t.includes('cookiessettings') ||
+                t.includes('全部允许') ||
+                t.includes('隐私偏好') ||
+                t.includes('preferencecenter')
+              );
+            }
+            function score(node) {
+              const text = textOf(node);
+              const compact = text.replace(/\\s+/g, '');
+              const lower = compact.toLowerCase();
+              if (isCookieUi(text)) return -100;
+              if (compact === '允许' || lower === 'allow') return 100;
+              if (lower === 'authorize' || lower === 'approve') return 90;
+              if (lower.includes('allow') && !lower.includes('all')) return 80;
+              return 0;
+            }
+            const nodes = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a'));
+            const ranked = nodes
+              .map((node) => ({ node, score: score(node), text: textOf(node) }))
+              .filter((item) => item.score > 0)
+              .sort((a, b) => b.score - a.score);
+            if (!ranked.length) return '';
+            const best = ranked[0];
+            const form = best.node.closest('form');
+            if (form) {
+              let actionInput = form.querySelector('input[name=action]');
+              if (!actionInput) {
+                actionInput = document.createElement('input');
+                actionInput.type = 'hidden';
+                actionInput.name = 'action';
+                form.appendChild(actionInput);
+              }
+              actionInput.value = 'allow';
+            }
+            best.node.click();
+            return best.text || 'Allow';
+            """
+        )
+        if clicked:
+            log("clicked consent allow: %s" % clicked)
+            return True
+    except Exception as exc:
+        log("consent allow js failed: %s" % exc)
+    return False
 
 
 def _wait_turnstile(page: Any, log: LogFn, timeout_sec: float, email: str = "", raise_on_timeout: bool = False) -> bool:
@@ -370,10 +501,10 @@ def approve_device_code(
         if "/consent" in url or "授权 Grok Build" in text or "Authorize Grok Build" in text:
             phase = "consent"
             if _cookie_banner_visible(_visible_text(page)):
-                _dismiss_cookie_banner(page, logger)
-                _sleep(0.6)
-                continue
-            if _click_exact(page, ["允许", "Allow", "Authorize", "Approve"], logger, real=True):
+                if _dismiss_cookie_banner(page, logger):
+                    _sleep(0.6)
+                    continue
+            if _click_consent_allow(page, logger):
                 _sleep(2.5)
                 continue
             try:
@@ -386,7 +517,7 @@ def approve_device_code(
                     }) || document.querySelector('form');
                     if (!form) return;
                     const formText = (form.innerText || '');
-                    if (formText.includes('隐私偏好') || formText.includes('全部允许') || /cookie/i.test(formText)) return;
+                    if (formText.includes('隐私偏好') || formText.includes('全部允许') || /accept all cookies|reject all|cookies settings/i.test(formText)) return;
                     let actionInput = form.querySelector('input[name=action]');
                     if (!actionInput) {
                       actionInput = document.createElement('input');
@@ -397,12 +528,15 @@ def approve_device_code(
                     actionInput.value = 'allow';
                     const button = [...form.querySelectorAll('button')].find((b) => {
                       const text = (b.innerText || '').trim();
-                      return text === '允许' || text === 'Allow' || text === 'Authorize' || text === 'Approve';
+                      const lower = text.toLowerCase();
+                      if (/accept all cookies|allow all|reject all|cookies settings/i.test(text)) return false;
+                      return text === '允许' || text === 'Allow' || text === 'Authorize' || text === 'Approve' || lower === 'allow';
                     });
                     if (button) button.click();
                     else form.submit();
                     """
                 )
+                logger("consent form fallback submitted")
                 _sleep(2.5)
             except Exception as exc:
                 logger("consent fallback failed: %s" % exc)

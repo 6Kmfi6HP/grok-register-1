@@ -575,7 +575,7 @@ def maybe_export_cpa_xai_after_success(email, password, sso="", log_callback=Non
         return {"ok": False, "error": str(exc)}
     current_page = None
     try:
-        current_page = _registration_browser.page
+        current_page = _registration_browser._get_page()
     except Exception:
         current_page = None
     try:
@@ -594,11 +594,18 @@ def maybe_export_cpa_xai_after_success(email, password, sso="", log_callback=Non
     if result.get("ok"):
         exported_path = result.get("hotload_path") or result.get("path") or ""
         suffix = f": {exported_path}" if exported_path else ""
-        if result.get("warning") or result.get("partial") or result.get("cpa_copy_error"):
-            detail = result.get("cpa_copy_error") or "后处理未完整完成"
+        if result.get("warning") or result.get("partial") or result.get("cpa_copy_error") or result.get("remote_upload_error"):
+            detail = (
+                result.get("remote_upload_error")
+                or result.get("cpa_copy_error")
+                or "后处理未完整完成"
+            )
             logger(f"[!] CPA OIDC 凭证已生成，但存在后处理警告{suffix}: {detail}")
         else:
             logger(f"[+] CPA OIDC 导出成功{suffix}")
+            remote = result.get("remote_upload") or {}
+            if remote.get("ok"):
+                logger(f"[+] CPA 远端上传成功: {remote.get('remote')} name={remote.get('name')}")
     elif not result.get("skipped"):
         logger(f"[!] CPA OIDC 导出失败，账号已保留: {result.get('error') or result}")
     return result
@@ -633,13 +640,13 @@ def retry_pending_file(pending_path, output_path=None, log_callback=None):
     return _retry_pending_file(pending_path, output_path=output_path, log_callback=log_callback)
 
 
-def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer):
-    from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch
+def run_registration_common(count, log_callback, cancel_callback, accounts_output_file, observer, worker_count=1):
+    from registration_flow import RegistrationCallbacks, RegistrationOperations, run_batch, run_batch_threaded
     callbacks = RegistrationCallbacks(log=log_callback, cancelled=cancel_callback)
     operations = RegistrationOperations(
         start_browser=lambda: start_browser(log_callback=log_callback),
         restart_browser=lambda: restart_browser(log_callback=log_callback),
-        browser_missing=lambda: _registration_browser.browser is None,
+        browser_missing=lambda: _registration_browser.browser_is_missing(),
         open_signup_page=lambda: open_signup_page(log_callback=log_callback, cancel_callback=cancel_callback),
         fill_email_and_submit=lambda: fill_email_and_submit(log_callback=log_callback, cancel_callback=cancel_callback),
         save_mail_credential=lambda email, token: _save_mail_credential(email, token, log_callback),
@@ -659,7 +666,8 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         cancelled_exception=RegistrationCancelled,
         retry_exception=AccountRetryNeeded,
     )
-    return run_batch(
+    threads = max(1, min(int(worker_count or 1), int(count), 10))
+    common_kwargs = dict(
         count=count,
         callbacks=callbacks,
         observer=observer,
@@ -669,6 +677,13 @@ def run_registration_common(count, log_callback, cancel_callback, accounts_outpu
         max_slot_retry=3,
         max_mail_retry=3,
     )
+    if threads > 1:
+        return run_batch_threaded(
+            worker_count=threads,
+            thread_start_interval=float(config.get("thread_start_interval", 0.8) or 0),
+            **common_kwargs,
+        )
+    return run_batch(**common_kwargs)
 
 
 class GrokRegisterGUI:
@@ -1068,13 +1083,14 @@ def cli_log(message):
     print(f"[{timestamp}] {message}", flush=True)
 
 
-def run_registration_cli(count):
+def run_registration_cli(count, worker_count=1):
     controller = CliStopController()
     accounts_output_file = os.path.join(
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
-    cli_log(f"[*] 终端模式启动，目标数量: {count}")
+    threads = max(1, min(int(worker_count or 1), int(count), 10))
+    cli_log(f"[*] 终端模式启动，目标数量: {count}，并发线程: {threads}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     last_stats = {"success": 0, "fail": 0, "pending": 0, "warnings": 0}
     def observer(batch, account, output):
@@ -1090,6 +1106,7 @@ def run_registration_cli(count):
             cancel_callback=controller.should_stop,
             accounts_output_file=accounts_output_file,
             observer=observer,
+            worker_count=threads,
         )
         last_stats["success"] = batch.success_count
         last_stats["fail"] = batch.fail_count
@@ -1104,7 +1121,75 @@ def run_registration_cli(count):
         cli_log(f"[*] 任务结束。成功 {last_stats['success']} | 失败 {last_stats['fail']} | 待恢复 {last_stats['pending']} | 后处理警告 {last_stats['warnings']}")
 
 
-def main_cli():
+def parse_cli_options(argv, default_count=1, default_threads=1):
+    """Parse CLI count/threads after the cli/start/--cli token.
+
+    Supported forms:
+      python grok_register_ttk.py cli 10
+      python grok_register_ttk.py cli --count 10 --threads 3
+      python grok_register_ttk.py cli -n 10 -t 2
+    """
+    count = None
+    threads = None
+    args = [str(item) for item in list(argv or [])[2:]]
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token in ("-n", "--count"):
+            if index + 1 >= len(args):
+                raise ValueError("缺少注册数量，例如: cli --count 10")
+            value = args[index + 1]
+            if not value.lstrip("+").isdigit():
+                raise ValueError(f"注册数量无效: {value}")
+            count = int(value)
+            index += 2
+            continue
+        if token.startswith("--count="):
+            value = token.split("=", 1)[1]
+            if not value.lstrip("+").isdigit():
+                raise ValueError(f"注册数量无效: {value}")
+            count = int(value)
+            index += 1
+            continue
+        if token in ("-t", "--threads"):
+            if index + 1 >= len(args):
+                raise ValueError("缺少线程数，例如: cli --threads 3")
+            value = args[index + 1]
+            if not value.lstrip("+").isdigit():
+                raise ValueError(f"线程数无效: {value}")
+            threads = int(value)
+            index += 2
+            continue
+        if token.startswith("--threads="):
+            value = token.split("=", 1)[1]
+            if not value.lstrip("+").isdigit():
+                raise ValueError(f"线程数无效: {value}")
+            threads = int(value)
+            index += 1
+            continue
+        if token.lstrip("+").isdigit():
+            count = int(token)
+            index += 1
+            continue
+        raise ValueError(f"未知 CLI 参数: {token}")
+    if count is None:
+        count = int(default_count or 1)
+    if threads is None:
+        threads = int(default_threads or 1)
+    if count < 1 or count > 2500:
+        raise ValueError("注册数量必须在 1~2500 之间")
+    if threads < 1 or threads > 10:
+        raise ValueError("并发线程数必须在 1~10 之间")
+    return count, threads
+
+
+def parse_cli_register_count(argv, default_count=1):
+    count, _threads = parse_cli_options(argv, default_count=default_count, default_threads=1)
+    return count
+
+
+def main_cli(argv=None):
+    argv = list(sys.argv if argv is None else argv)
     try:
         load_config()
     except ConfigError as exc:
@@ -1117,9 +1202,24 @@ def main_cli():
     except ConfigError as exc:
         cli_log(f"[!] {exc}")
         return
-    count = int(config.get("register_count", 1) or 1)
+    default_count = int(config.get("register_count", 1) or 1)
+    default_threads = int(config.get("register_threads", 1) or 1)
+    try:
+        count, threads = parse_cli_options(
+            argv,
+            default_count=default_count,
+            default_threads=default_threads,
+        )
+    except ValueError as exc:
+        cli_log(f"[!] {exc}")
+        cli_log("[*] 用法: python grok_register_ttk.py cli [数量] [--threads N] | cli -n 数量 -t 线程数")
+        return
+    config["register_count"] = count
+    config["register_threads"] = threads
     cli_log("[*] CLI 已加载配置")
-    cli_log(f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count}")
+    cli_log(
+        f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 注册数量: {count} | 并发线程: {threads}"
+    )
     cli_log("[*] 输入 start 后开始；按 Ctrl+C 可强制停止")
     try:
         command = input("> ").strip().lower()
@@ -1129,7 +1229,7 @@ def main_cli():
     if command != "start":
         cli_log("[!] 未输入 start，已退出")
         return
-    run_registration_cli(count)
+    run_registration_cli(count, worker_count=threads)
 
 
 def main():
@@ -1150,7 +1250,7 @@ def main():
             log_exception("pending 恢复失败", exc, cli_log)
         return
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
-        main_cli()
+        main_cli(sys.argv)
         return
     if not TK_AVAILABLE:
         print(f"[!] GUI 模式需要 Tkinter，但当前环境不可用: {TK_IMPORT_ERROR}", file=sys.stderr)

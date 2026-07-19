@@ -13,8 +13,11 @@ YYDS_API_BASE = "https://maliapi.215.im/v1"
 
 
 config = {}
+import threading
+
 _cf_domain_index = 0
 _cloudmail_domain_index = 0
+_domain_index_lock = threading.Lock()
 _OWN_NAMES = {'cloudmail_get_email_and_token', 'get_messages', 'cloudflare_get_messages', 'get_yyds_api_key', 'yyds_generate_username', 'yyds_get_domains', 'yyds_get_email_and_token', 'yyds_get_oai_code', 'get_email_provider', 'cloudflare_get_domains', 'extract_verification_code', 'get_cloudflare_api_base', 'cloudflare_apply_auth_params', 'duckmail_get_oai_code', 'create_account', 'get_yyds_jwt', 'get_message_detail', 'yyds_create_account', 'get_duckmail_api_key', 'get_cloudflare_path', 'cloudflare_create_account', 'cloudflare_get_token', 'cloudflare_get_oai_code', 'get_cloudmail_public_token', 'generate_username', 'yyds_get_message_detail', 'cloudflare_next_default_domain', 'yyds_get_messages', 'yyds_get_token', 'get_domains', 'get_token', 'cloudflare_create_temp_address', 'get_cloudflare_api_key', 'get_cloudmail_path', 'get_cloudmail_api_base', 'cloudmail_get_oai_code', 'cloudflare_build_headers', 'cloudflare_is_admin_create_path', 'cloudmail_next_domain', 'cloudflare_get_message_detail', 'cloudmail_get_messages', 'get_user_agent', 'yyds_pick_domain', '_pick_list_payload', 'get_email_and_token', 'get_oai_code', 'get_cloudflare_auth_mode', 'pick_domain'}
 
 
@@ -291,8 +294,9 @@ def cloudflare_next_default_domain():
     domains = [x.strip() for x in str(config.get("defaultDomains", "") or "").split(",") if x.strip()]
     if not domains:
         return ""
-    domain = domains[_cf_domain_index % len(domains)]
-    _cf_domain_index += 1
+    with _domain_index_lock:
+        domain = domains[_cf_domain_index % len(domains)]
+        _cf_domain_index += 1
     return domain
 
 def cloudmail_get_email_and_token():
@@ -398,7 +402,8 @@ def cloudmail_get_oai_code(
                 continue
             code_value = str(msg.get("code", "") or "").strip()
             combined = normalize_mail_body(msg)
-            if code_value:
+            # Only trust API-provided codes that already look like xAI OTP tokens.
+            if code_value and re.fullmatch(r"[A-Z0-9]{3}-[A-Z0-9]{3}", code_value):
                 combined = f"verification code: {code_value}\n{combined}"
             subject = str(msg.get("subject", "") or "")
             if log_callback:
@@ -426,8 +431,9 @@ def cloudmail_next_domain():
     ]
     if not domains:
         return ""
-    domain = domains[_cloudmail_domain_index % len(domains)]
-    _cloudmail_domain_index += 1
+    with _domain_index_lock:
+        domain = domains[_cloudmail_domain_index % len(domains)]
+        _cloudmail_domain_index += 1
     return domain
 
 def create_account(address, password, api_key=None, expires_in=0):
@@ -489,19 +495,42 @@ def duckmail_get_oai_code(
     raise Exception(f"在 {timeout}s 内未收到验证码邮件")
 
 def extract_verification_code(text, subject=""):
-    if subject:
-        match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    match = re.search(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", text, re.IGNORECASE)
+    subject = str(subject or "")
+    text = str(text or "")
+    # xAI codes are uppercase like PAS-VC1; avoid HTML/CSS false positives (per-100).
+    otp_token = r"([A-Z0-9]{3}-[A-Z0-9]{3})"
+    contextual = [
+        rf"(?:confirmation|verification|confirm)\s+code[:\s]+{otp_token}",
+        rf"your\s+code[:\s]+{otp_token}",
+        rf"{otp_token}\s+xAI",
+        rf"^SpaceXAI\s+confirmation\s+code[:\s]+{otp_token}",
+    ]
+
+    def _pick(source, patterns):
+        for pattern in patterns:
+            match = re.search(pattern, source, re.MULTILINE)
+            if match:
+                return match.group(1)
+
+    code = _pick(subject, contextual)
+    if code:
+        return code
+    match = re.search(rf"\b{otp_token}\b", subject)
     if match:
         return match.group(1)
-    patterns = [
+
+    code = _pick(text, contextual)
+    if code:
+        return code
+    match = re.search(rf"\b{otp_token}\b", text)
+    if match:
+        return match.group(1)
+
+    for pattern in (
         r"verification\s+code[:\s]+(\d{4,8})",
         r"your\s+code[:\s]+(\d{4,8})",
         r"confirm(?:ation)?\s+code[:\s]+(\d{4,8})",
-    ]
-    for pattern in patterns:
+    ):
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             return match.group(1)

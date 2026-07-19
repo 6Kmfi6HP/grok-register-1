@@ -328,7 +328,17 @@ python grok_register_ttk.py start
 python grok_register_ttk.py --cli
 ```
 
-CLI 读取 `config.json` 中的 `register_count`，通过运行校验后提示：
+默认读取 `config.json` 中的 `register_count` / `register_threads`。也可用命令行覆盖：
+
+```bash
+python grok_register_ttk.py cli 10
+python grok_register_ttk.py cli --count 10 --threads 3
+python grok_register_ttk.py cli -n 10 -t 2
+```
+
+多线程时每个 worker 使用独立 Chromium（TabPool 隔离）。有头浏览器建议 `1~3` 线程。
+
+通过运行校验后提示：
 
 ```text
 > start

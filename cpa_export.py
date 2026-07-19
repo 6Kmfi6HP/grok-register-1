@@ -1,12 +1,16 @@
-"""在注册成功后可选生成 CPA xAI OIDC 凭证并复制到热加载目录。"""
+"""在注册成功后可选生成 CPA xAI OIDC 凭证、复制到热加载目录，并上传到远端 CPA。"""
 from dataclasses import dataclass
 import importlib.util
+import json
 import os
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_AUTH_DIR = _ROOT / "cpa_auths"
@@ -27,6 +31,9 @@ class CpaExportSettings:
     force_standalone: bool
     cookie_inject: bool
     tools_dir: str
+    auto_upload_remote: bool
+    remote_base: str
+    management_key: str
 
     @classmethod
     def from_config(cls, config):
@@ -38,6 +45,9 @@ class CpaExportSettings:
         hotload_dir = Path(hotload_value).expanduser() if hotload_value else None
         if hotload_dir is not None and not hotload_dir.is_absolute():
             hotload_dir = (_ROOT / hotload_dir).resolve()
+        management_key = str(
+            cfg.get("cpa_management_key") or cfg.get("cpa_api_key") or ""
+        ).strip()
         return cls(
             enabled=bool(cfg.get("cpa_export_enabled", True)),
             auth_dir=auth_dir,
@@ -52,7 +62,58 @@ class CpaExportSettings:
             force_standalone=bool(cfg.get("cpa_force_standalone", True)),
             cookie_inject=bool(cfg.get("cpa_mint_cookie_inject", True)),
             tools_dir=str(cfg.get("api_reverse_tools") or "").strip(),
+            auto_upload_remote=bool(cfg.get("cpa_auto_upload_remote", False)),
+            remote_base=str(cfg.get("cpa_remote_base") or "").strip().rstrip("/"),
+            management_key=management_key,
         )
+
+
+def upload_auth_to_remote_cpa(
+    auth_path,
+    *,
+    remote_base,
+    management_key,
+    log_callback: Optional[Callable[[str], None]] = None,
+    timeout_sec: float = 30,
+):
+    """Upload a local xai-*.json to CLIProxyAPI management auth-files."""
+    log = log_callback or (lambda message: None)
+    base = str(remote_base or "").strip().rstrip("/")
+    key = str(management_key or "").strip()
+    source = Path(auth_path)
+    if not base or not key:
+        return {"ok": False, "skipped": True, "reason": "remote_base/management_key missing"}
+    if not source.is_file():
+        return {"ok": False, "error": "auth file missing: %s" % source}
+
+    url = "%s/v0/management/auth-files?name=%s" % (base, urllib.parse.quote(source.name))
+    body = source.read_bytes()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": "Bearer %s" % key,
+            "X-Management-Key": key,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw) if raw else {"status": "ok"}
+            except json.JSONDecodeError:
+                payload = {"status": "ok", "raw": raw}
+            log("[cpa] remote upload ok -> %s name=%s" % (base, source.name))
+            return {"ok": True, "remote": base, "name": source.name, "response": payload}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
+        log("[cpa] remote upload HTTP %s: %s" % (exc.code, detail[:300]))
+        return {"ok": False, "error": "HTTP %s: %s" % (exc.code, detail[:300])}
+    except Exception as exc:
+        log("[cpa] remote upload failed: %s" % exc)
+        return {"ok": False, "error": str(exc)}
 
 
 def _load_mint_and_export(tools_dir=""):
@@ -179,6 +240,23 @@ def export_cpa_xai_for_account(email, password, page=None, cookies=None, sso=Non
             result["warning"] = True
             result["partial"] = True
             log("[cpa] hotload copy failed: %s" % exc)
+    if result.get("ok") and result.get("path") and settings.auto_upload_remote:
+        remote = upload_auth_to_remote_cpa(
+            result["path"],
+            remote_base=settings.remote_base,
+            management_key=settings.management_key,
+            log_callback=log,
+        )
+        result["remote_upload"] = remote
+        if remote.get("skipped"):
+            result["remote_upload_error"] = remote.get("reason") or "remote upload skipped"
+            result["warning"] = True
+            result["partial"] = True
+            log("[cpa] remote upload skipped: %s" % result["remote_upload_error"])
+        elif not remote.get("ok"):
+            result["remote_upload_error"] = remote.get("error") or "remote upload failed"
+            result["warning"] = True
+            result["partial"] = True
     if not result.get("ok"):
         fail_path = settings.auth_dir / "cpa_auth_failed.txt"
         try:

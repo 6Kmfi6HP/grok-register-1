@@ -4,11 +4,14 @@ import random
 import re
 import secrets
 import struct
+import threading
 import time
 
 from DrissionPage import Chromium
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
+
+from tab_pool import TabPool
 
 browser = None
 page = None
@@ -16,7 +19,16 @@ browser_proxy_bridge = None
 browser_started_with_proxy = False
 cf_clearance = ""
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
-_OWN_NAMES = {'is_cloudflare_block_response', 'response_preview', 'start_browser', 'enable_nsfw_for_token', 'stop_browser_proxy_bridge', 'set_tos_accepted', 'fill_email_and_submit', 'getTurnstileToken', 'set_birth_date', 'generate_random_birthdate', 'fill_profile_and_submit', 'click_email_signup_button', 'wait_for_sso_cookie', 'fill_code_and_submit', 'build_profile', 'cleanup_runtime_memory', 'open_signup_page', 'stop_browser', 'encode_grpc_nsfw_settings', 'restart_browser', 'has_profile_form', 'update_nsfw_settings', 'refresh_active_page'}
+_tls = threading.local()
+_OWN_NAMES = {
+    'is_cloudflare_block_response', 'response_preview', 'start_browser', 'enable_nsfw_for_token',
+    'stop_browser_proxy_bridge', 'set_tos_accepted', 'fill_email_and_submit', 'getTurnstileToken',
+    'set_birth_date', 'generate_random_birthdate', 'fill_profile_and_submit', 'click_email_signup_button',
+    'wait_for_sso_cookie', 'fill_code_and_submit', 'build_profile', 'cleanup_runtime_memory',
+    'open_signup_page', 'stop_browser', 'encode_grpc_nsfw_settings', 'restart_browser', 'has_profile_form',
+    'update_nsfw_settings', 'refresh_active_page', '_get_page', '_get_browser', 'browser_is_missing',
+    'prepare_browser_for_next_account', 'shutdown_browsers',
+}
 
 
 def bind_runtime(namespace):
@@ -26,6 +38,36 @@ def bind_runtime(namespace):
         }:
             continue
         globals()[name] = value
+
+
+def _get_browser():
+    pooled = TabPool.get_browser()
+    if pooled is not None:
+        return pooled
+    return browser
+
+
+def _get_page():
+    if TabPool.get_browser() is not None:
+        return TabPool.get_tab()
+    return page
+
+
+def browser_is_missing():
+    return _get_browser() is None
+
+
+def _set_thread_proxy_state(bridge=None, started_with_proxy=False):
+    _tls.bridge = bridge
+    _tls.started_with_proxy = bool(started_with_proxy)
+
+
+def _thread_proxy_bridge():
+    return getattr(_tls, "bridge", None)
+
+
+def _thread_started_with_proxy():
+    return bool(getattr(_tls, "started_with_proxy", False))
 
 
 def generate_random_birthdate():
@@ -189,47 +231,62 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
 
 def stop_browser_proxy_bridge():
     global browser_proxy_bridge
-    if browser_proxy_bridge is not None:
+    bridge = _thread_proxy_bridge()
+    if bridge is None:
+        bridge = browser_proxy_bridge
+    if bridge is not None:
         try:
-            browser_proxy_bridge.stop()
+            bridge.stop()
         except Exception:
             pass
-    browser_proxy_bridge = None
+    _set_thread_proxy_state(bridge=None, started_with_proxy=_thread_started_with_proxy())
+    if bridge is browser_proxy_bridge:
+        browser_proxy_bridge = None
+
 
 def start_browser(log_callback=None, use_proxy=True):
     global browser, page, browser_proxy_bridge, browser_started_with_proxy
     last_exc = None
     proxy_enabled = bool(use_proxy and get_configured_proxy())
+
+    def options_factory():
+        browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
+        _set_thread_proxy_state(bridge=bridge, started_with_proxy=bool(browser_proxy))
+        return create_browser_options(browser_proxy=browser_proxy)
+
     for attempt in range(1, 5):
-        bridge = None
         try:
-            browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
-            browser = Chromium(create_browser_options(browser_proxy=browser_proxy))
-            browser_proxy_bridge = bridge
-            browser_started_with_proxy = bool(browser_proxy)
-            tabs = browser.get_tabs()
-            page = tabs[-1] if tabs else browser.new_tab()
-            if log_callback and getattr(browser, "user_data_path", None):
-                log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
+            TabPool.init(options_factory, log_callback=log_callback)
+            # Ensure this thread gets a fresh browser if previous one died.
+            if TabPool.get_browser() is None:
+                active_page = TabPool.get_tab()
+            else:
+                active_page = TabPool.get_tab()
+            active_browser = TabPool.get_browser()
+            # Keep legacy globals in sync for single-thread / compat readers.
+            browser = active_browser
+            page = active_page
+            browser_proxy_bridge = _thread_proxy_bridge()
+            browser_started_with_proxy = _thread_started_with_proxy()
+            if log_callback and getattr(active_browser, "user_data_path", None):
+                log_callback(f"[Debug] 当前浏览器资料目录: {active_browser.user_data_path}")
             if log_callback and get_configured_proxy():
                 mode = "代理" if browser_started_with_proxy else "直连"
                 log_callback(f"[*] 浏览器网络模式: {mode}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
-            return browser, page
+            return active_browser, active_page
         except Exception as exc:
             last_exc = exc
-            if bridge is not None:
-                try:
-                    bridge.stop()
-                except Exception:
-                    pass
             if log_callback:
                 mode = "代理" if proxy_enabled else "直连"
                 log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {exc}")
             try:
-                if browser is not None:
-                    browser.quit(del_data=True)
+                stop_browser_proxy_bridge()
+            except Exception:
+                pass
+            try:
+                TabPool.release_tab()
             except Exception:
                 pass
             browser = None
@@ -239,26 +296,43 @@ def start_browser(log_callback=None, use_proxy=True):
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
+
 def stop_browser():
     global browser, page, browser_started_with_proxy
-    if browser is not None:
-        try:
-            browser.quit(del_data=True)
-        except Exception:
-            pass
     stop_browser_proxy_bridge()
+    TabPool.release_tab()
     browser = None
     page = None
     browser_started_with_proxy = False
+
 
 def restart_browser(log_callback=None, use_proxy=True):
     stop_browser()
     return start_browser(log_callback=log_callback, use_proxy=use_proxy)
 
+
+def prepare_browser_for_next_account(log_callback=None, force_recycle=False, recycle_every=25):
+    reuse = not force_recycle
+    served = TabPool.served_count()
+    every = int(recycle_every or 0)
+    if reuse and TabPool.get_browser() is not None and (every <= 0 or served < every):
+        if TabPool.clear_session(log_callback=log_callback):
+            TabPool.mark_served()
+            return TabPool.get_browser(), _get_page()
+    if log_callback:
+        log_callback(f"[*] 浏览器完整回收（reuse={reuse}, served={served}, every={every}）")
+    return restart_browser(log_callback=log_callback)
+
+
+def shutdown_browsers():
+    stop_browser()
+    TabPool.shutdown()
+
+
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
     if log_callback:
         log_callback(f"[*] {reason}: 关闭浏览器并清理内存")
-    stop_browser()
+    shutdown_browsers()
     try:
         from cpa_xai.browser_confirm import shutdown_mint_browsers
         shutdown_mint_browsers()
@@ -269,22 +343,34 @@ def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
     if log_callback:
         log_callback(f"[*] Python GC 已回收对象数: {collected}")
 
+
 def refresh_active_page():
     global browser, page
-    if browser is None:
+    if TabPool.get_browser() is None and browser is None:
         restart_browser()
     try:
-        tabs = browser.get_tabs()
+        active_browser = _get_browser()
+        tabs = active_browser.get_tabs() if hasattr(active_browser, "get_tabs") else []
+        if not tabs:
+            try:
+                tabs = active_browser.tab_ids or []
+            except Exception:
+                tabs = []
         if tabs:
-            page = tabs[-1]
+            if hasattr(active_browser, "get_tabs"):
+                page = tabs[-1]
+            else:
+                page = active_browser.get_tab(tabs[-1])
         else:
-            page = browser.new_tab()
+            page = active_browser.new_tab()
+        browser = active_browser
+        TabPool.sync_tab()
     except Exception:
         restart_browser()
-    return page
+    return _get_page()
 
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
-    global page
+    page = _get_page()
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -353,26 +439,33 @@ return candidates[0].text || true;
 def open_signup_page(log_callback=None, cancel_callback=None):
     global browser, page
     raise_if_cancelled(cancel_callback)
-    if browser is None:
+    if browser_is_missing():
         start_browser(log_callback=log_callback)
         if log_callback:
             log_callback("[*] 浏览器已启动")
 
     def _open_with_current_browser():
-        global page
+        global browser, page
+        active_browser = _get_browser()
         try:
-            page = browser.get_tab(0)
+            try:
+                page = active_browser.get_tab(0)
+            except Exception:
+                tabs = list(getattr(active_browser, "tab_ids", None) or [])
+                page = active_browser.get_tab(tabs[0]) if tabs else active_browser.new_tab()
             page.get(SIGNUP_URL)
         except Exception as e:
             if log_callback:
                 log_callback(f"[Debug] 打开URL异常: {e}")
-            page = browser.new_tab(SIGNUP_URL)
+            page = active_browser.new_tab(SIGNUP_URL)
         page.wait.doc_loaded()
+        browser = active_browser
+        TabPool.sync_tab()
 
     try:
         _open_with_current_browser()
     except Exception as e:
-        if browser_started_with_proxy and get_configured_proxy():
+        if _thread_started_with_proxy() and get_configured_proxy():
             if log_callback:
                 log_callback(f"[!] 浏览器代理访问注册页失败，自动回退直连: {e}")
             restart_browser(log_callback=log_callback, use_proxy=False)
@@ -380,20 +473,23 @@ def open_signup_page(log_callback=None, cancel_callback=None):
         else:
             raise
 
-    if browser_started_with_proxy and page_has_proxy_error(page):
+    page = _get_page()
+    if _thread_started_with_proxy() and page_has_proxy_error(page):
         if log_callback:
             log_callback("[!] 浏览器页面显示代理错误，自动回退直连")
         restart_browser(log_callback=log_callback, use_proxy=False)
         _open_with_current_browser()
+        page = _get_page()
 
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
-        log_callback(f"[*] 当前URL: {page.url}")
+        log_callback(f"[*] 当前URL: {page.url if page else 'unknown'}")
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )
 
 def has_profile_form(log_callback=None):
+    page = _get_page()
     refresh_active_page()
     try:
         return bool(
@@ -410,6 +506,7 @@ return !!(givenInput && familyInput && passwordInput);
         return False
 
 def fill_email_and_submit(timeout=45, log_callback=None, cancel_callback=None):
+    page = _get_page()
     raise_if_cancelled(cancel_callback)
     email, dev_token = get_email_and_token()
     if not email or not dev_token:
@@ -669,8 +766,10 @@ return 'enter';
     raise Exception("未找到邮箱输入框或注册按钮")
 
 def fill_code_and_submit(email, dev_token, timeout=180, log_callback=None, cancel_callback=None):
+    page = _get_page()
     def _resend_code():
-        page.run_js(
+        active = _get_page() or page
+        active.run_js(
             r"""
 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 const target = nodes.find((node) => {
@@ -691,126 +790,262 @@ return false;
     )
     if not code:
         raise Exception("获取验证码失败")
-    clean_code = str(code).replace("-", "").strip()
+    clean_code = str(code).replace("-", "").strip().upper()
     deadline = time.time() + timeout
+    last_diag = ""
+    last_fill_at = 0.0
+    last_fill_method = ""
 
-    while time.time() < deadline:
-        raise_if_cancelled(cancel_callback)
-        filled = page.run_js(
+    def _focus_otp_input():
+        return page.run_js(
             """
-const code = String(arguments[0] || '').trim();
-if (!code) return 'empty-code';
-
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
+const input = [
+  'input[data-input-otp]',
+  'input[data-input-otp=\"true\"]',
+  'input[name=\"code\"]',
+  'input[autocomplete=\"one-time-code\"]',
+  'input[inputmode=\"numeric\"]'
+].flatMap((sel) => Array.from(document.querySelectorAll(sel)))
+ .find((node) => !node.disabled && !node.readOnly && Number(node.maxLength || 6) > 1 && isVisible(node));
+if (!input) return false;
+input.focus();
+input.click();
+try { input.setSelectionRange(0, input.value.length); } catch (e) {}
+return true;
+            """
+        )
 
+    def _otp_value():
+        try:
+            return str(
+                page.run_js(
+                    """
+const input = document.querySelector('input[data-input-otp], input[autocomplete="one-time-code"], input[name="code"]');
+return String((input && input.value) || '').replace(/\\s+/g, '');
+                    """
+                )
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def _fill_with_actions():
+        if not _focus_otp_input():
+            return ""
+        try:
+            # Avoid ele.input(clear=True): on macOS clear() sets value via JS and breaks React.
+            page.actions.type("\ue003" * 8)  # Backspace
+            page.actions.type(clean_code, interval=0.04)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] CDP 逐字输入失败: {exc}")
+            return ""
+        value = _otp_value().replace("-", "").upper()
+        if value == clean_code:
+            return "actions-type"
+        if value:
+            return f"actions-partial:{value}"
+        return "actions-empty"
+
+    def _fill_with_js():
+        return page.run_js(
+            """
+const code = String(arguments[0] || '').trim();
+if (!code) return 'empty-code';
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+function currentValue(input) {
+    return String(input?.value || '').replace(/\\s+/g, '');
+}
 function setInputValue(input, value) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+    const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+    const nativeSetter = proto && proto.set;
     const tracker = input._valueTracker;
-    if (tracker) tracker.setValue('');
+    if (tracker) tracker.setValue(input.value || '');
     if (nativeSetter) nativeSetter.call(input, value);
     else input.value = value;
-    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
     input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
 }
-
-const aggregate = Array.from(document.querySelectorAll(
-  'input[data-input-otp=\"true\"], input[name=\"code\"], input[autocomplete=\"one-time-code\"], input[inputmode=\"numeric\"], input[inputmode=\"text\"]'
-)).find((node) => isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 6) > 1);
-
-if (aggregate) {
-    aggregate.focus();
-    aggregate.click();
-    setInputValue(aggregate, code);
-    return String(aggregate.value || '').replace(/\\s+/g, '') ? 'filled-aggregate' : 'aggregate-failed';
+const input = [
+  'input[data-input-otp]',
+  'input[data-input-otp=\"true\"]',
+  'input[name=\"code\"]',
+  'input[autocomplete=\"one-time-code\"]',
+  'input[inputmode=\"numeric\"]'
+].flatMap((sel) => Array.from(document.querySelectorAll(sel)))
+ .find((node) => !node.disabled && !node.readOnly && Number(node.maxLength || 6) > 1 && isVisible(node));
+if (!input) return 'not-ready';
+input.focus();
+input.click();
+try { document.execCommand('selectAll', false, null); } catch (e) {}
+try { document.execCommand('delete', false, null); } catch (e) {}
+let typed = true;
+for (const ch of code) {
+    let ok = false;
+    try { ok = document.execCommand('insertText', false, ch); } catch (e) { ok = false; }
+    if (!ok) typed = false;
 }
-
-const otpBoxes = Array.from(document.querySelectorAll('input')).filter((node) => {
-    if (!isVisible(node) || node.disabled || node.readOnly) return false;
-    const maxLength = Number(node.maxLength || 0);
-    const ac = String(node.autocomplete || '').toLowerCase();
-    return maxLength === 1 || ac === 'one-time-code';
-});
-
-if (otpBoxes.length >= code.length) {
-    for (let i = 0; i < code.length; i += 1) {
-        const ch = code[i] || '';
-        const box = otpBoxes[i];
-        box.focus();
-        box.click();
-        setInputValue(box, ch);
-        box.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: ch }));
-        box.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: ch }));
-    }
-    const merged = otpBoxes.slice(0, code.length).map((x) => String(x.value || '').trim()).join('');
-    return merged.length ? 'filled-boxes' : 'boxes-failed';
-}
-
-return 'not-ready';
+if (typed && currentValue(input) === code) return 'filled-js-typed';
+setInputValue(input, code);
+return currentValue(input) === code ? 'filled-js-setter' : ('aggregate-failed:' + currentValue(input));
             """,
             clean_code,
         )
 
-        if filled == "not-ready":
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-        if "failed" in str(filled):
-            if log_callback:
-                log_callback(f"[Debug] 验证码填写失败: {filled}")
-            sleep_with_cancel(0.5, cancel_callback)
-            continue
-
-        clicked = page.run_js(
+    def _click_confirm():
+        return page.run_js(
             r"""
 function isVisible(node) {
     if (!node) return false;
     const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
     const rect = node.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
 }
-
-const buttons = Array.from(document.querySelectorAll('button[type=\"submit\"], button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-
-const btn = buttons.find((node) => {
-    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
+function textOf(node) {
+    return [
+        node.innerText,
+        node.textContent,
+        node.getAttribute('aria-label'),
+        node.getAttribute('title'),
+        node.getAttribute('value'),
+    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function isConfirmText(node) {
+    const t = textOf(node).replace(/\s+/g, '').toLowerCase();
     return (
         t.includes('确认邮箱') ||
+        t.includes('confirmemail') ||
+        t.includes('confirm') ||
+        t.includes('verify') ||
         t.includes('继续') ||
         t.includes('下一步') ||
-        t.includes('confirm') ||
         t.includes('continue') ||
-        t.includes('next')
+        t.includes('next') ||
+        t.includes('submit')
     );
-});
+}
+function isEnabled(node) {
+    if (!node || node.disabled) return false;
+    if (node.getAttribute('aria-disabled') === 'true') return false;
+    return true;
+}
 
-if (!btn) return 'no-button';
+const otp = document.querySelector('input[data-input-otp], input[autocomplete="one-time-code"], input[name="code"]');
+const otpValue = String((otp && otp.value) || '').replace(/\s+/g, '');
+const allButtons = Array.from(document.querySelectorAll(
+  'button[type="submit"], button, [role="button"], input[type="submit"], a'
+)).filter((node) => isVisible(node));
+const buttonSnapshot = allButtons.map((node) => ({
+    text: textOf(node).slice(0, 80),
+    disabled: !!node.disabled,
+    ariaDisabled: node.getAttribute('aria-disabled') || '',
+})).filter((item) => item.text).slice(0, 8);
+
+let candidates = allButtons.filter((node) => isConfirmText(node));
+if (!candidates.length && otp) {
+    candidates = allButtons.filter((node) => {
+        const tag = (node.tagName || '').toLowerCase();
+        return tag === 'button' || node.getAttribute('type') === 'submit' || node.getAttribute('role') === 'button';
+    });
+}
+if (!candidates.length) {
+    return { status: 'no-button', otp: otpValue, url: location.href, buttons: buttonSnapshot };
+}
+
+const btn = candidates.find((node) => isEnabled(node));
+if (!btn) {
+    return { status: 'button-disabled', otp: otpValue, url: location.href, buttons: buttonSnapshot };
+}
 btn.focus();
 btn.click();
-return 'clicked';
+const form = (otp && otp.closest('form')) || btn.closest('form');
+if (form && typeof form.requestSubmit === 'function') {
+    try { form.requestSubmit(btn); } catch (e) { try { form.requestSubmit(); } catch (e2) {} }
+}
+return { status: 'clicked', otp: otpValue, url: location.href, buttons: buttonSnapshot };
             """
         )
 
-        if clicked == "clicked" or clicked == "no-button":
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+
+        # OTP may auto-advance once React state is complete.
+        if has_profile_form():
             if log_callback:
-                log_callback(f"[*] 已填写验证码并提交: {code}")
-            sleep_with_cancel(1.5, cancel_callback)
+                log_callback(f"[*] 验证码已通过，已进入资料页: {code} ({last_fill_method or 'auto'})")
             return code
 
+        now = time.time()
+        should_refill = (now - last_fill_at) >= (0.0 if not last_fill_method else 3.0)
+        if should_refill:
+            method = _fill_with_actions()
+            if method in ("", "actions-empty") or str(method).startswith("actions-partial"):
+                js_method = str(_fill_with_js() or "")
+                if js_method and js_method not in ("not-ready", "empty-code") and not js_method.startswith("aggregate-failed"):
+                    method = js_method
+                elif not method:
+                    method = js_method or "not-ready"
+            if method in ("", "not-ready", "empty-code", "actions-empty") or str(method).startswith("aggregate-failed"):
+                if log_callback:
+                    log_callback(f"[Debug] 验证码填写未就绪: {method or 'no-input'}")
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
+            last_fill_method = method
+            last_fill_at = now
+            if log_callback:
+                log_callback(f"[Debug] 验证码写入方式: {method}, otp={_otp_value()}")
+            sleep_with_cancel(0.5, cancel_callback)
+
+        clicked = _click_confirm()
+        status = clicked.get("status") if isinstance(clicked, dict) else clicked
+        otp_value = clicked.get("otp") if isinstance(clicked, dict) else ""
+        if status == "clicked":
+            sleep_with_cancel(1.0, cancel_callback)
+            if has_profile_form() or status == "clicked":
+                if log_callback:
+                    log_callback(f"[*] 已填写验证码并提交: {code} ({last_fill_method})")
+                sleep_with_cancel(0.8, cancel_callback)
+                return code
+
+        if has_profile_form():
+            if log_callback:
+                log_callback(f"[*] 验证码已通过，已进入资料页: {code} ({last_fill_method})")
+            return code
+
+        last_diag = f"fill={last_fill_method}, click={status}, otp={otp_value}"
+        if log_callback and status in ("button-disabled", "no-button"):
+            buttons = ""
+            url = ""
+            if isinstance(clicked, dict):
+                url = clicked.get("url") or ""
+                buttons = " | ".join(
+                    f"{b.get('text','')}:disabled={b.get('disabled')}"
+                    for b in (clicked.get("buttons") or [])[:5]
+                )
+            log_callback(f"[Debug] 等待 Confirm email: {last_diag}; url={url}; {buttons}")
         sleep_with_cancel(0.5, cancel_callback)
 
-    raise Exception("验证码已获取，但自动填写/提交失败")
+    raise Exception(
+        "验证码已获取，但自动填写/提交失败"
+        + (f" ({last_diag})" if last_diag else "")
+    )
 
 def getTurnstileToken(log_callback=None, cancel_callback=None):
-    global page
+    page = _get_page()
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
@@ -913,6 +1148,7 @@ def build_profile():
     return given_name, family_name, password
 
 def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
+    page = _get_page()
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     form_filled_once = False
@@ -1147,6 +1383,7 @@ return String(cfInput.value || '').trim().length;
     raise Exception("最终注册页资料填写失败")
 
 def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
+    page = _get_page()
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0

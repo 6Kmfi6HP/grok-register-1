@@ -22,6 +22,33 @@ class PostModularizationRegressionTests(unittest.TestCase):
             "https://accounts.x.ai/sign-up?redirect=grok-com",
         )
 
+    def test_parse_cli_register_count_overrides_default(self):
+        self.assertEqual(app.parse_cli_register_count(["prog", "cli"], default_count=3), 3)
+        self.assertEqual(app.parse_cli_register_count(["prog", "cli", "10"], default_count=3), 10)
+        self.assertEqual(app.parse_cli_register_count(["prog", "cli", "--count", "7"], default_count=3), 7)
+        self.assertEqual(app.parse_cli_register_count(["prog", "cli", "-n", "5"], default_count=3), 5)
+        self.assertEqual(app.parse_cli_register_count(["prog", "cli", "--count=8"], default_count=3), 8)
+        with self.assertRaises(ValueError):
+            app.parse_cli_register_count(["prog", "cli", "0"], default_count=3)
+        with self.assertRaises(ValueError):
+            app.parse_cli_register_count(["prog", "cli", "--oops"], default_count=3)
+
+    def test_parse_cli_options_supports_threads(self):
+        count, threads = app.parse_cli_options(
+            ["prog", "cli", "--count", "9", "--threads", "3"],
+            default_count=1,
+            default_threads=1,
+        )
+        self.assertEqual((count, threads), (9, 3))
+        count, threads = app.parse_cli_options(
+            ["prog", "cli", "-n", "4", "-t", "2"],
+            default_count=1,
+            default_threads=1,
+        )
+        self.assertEqual((count, threads), (4, 2))
+        with self.assertRaises(ValueError):
+            app.parse_cli_options(["prog", "cli", "--threads", "0"], default_count=1, default_threads=1)
+
     def test_config_identity_survives_load(self):
         original_path = app_config.CONFIG_FILE
         try:

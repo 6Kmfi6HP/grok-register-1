@@ -1,5 +1,8 @@
 """编排 GUI 与 CLI 共用的单账号注册和批量执行流程。"""
 from dataclasses import dataclass, field
+import queue
+import threading
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 
@@ -324,6 +327,191 @@ def run_batch(count, callbacks, observer, ops, enable_nsfw=True, cleanup_interva
                 break
             if not _prepare_next_account(result, settings, callbacks, ops):
                 break
+    finally:
+        _run_cleanup_safely(ops, callbacks, "任务结束")
+    return result
+
+
+def run_batch_threaded(
+    count,
+    worker_count,
+    callbacks,
+    observer,
+    ops,
+    enable_nsfw=True,
+    cleanup_interval=5,
+    max_slot_retry=3,
+    max_mail_retry=3,
+    thread_start_interval=0.8,
+    settings=None,
+):
+    """Run registration with one Chromium per worker thread (TabPool isolation)."""
+    if settings is None:
+        settings = RegistrationSettings(
+            count=int(count),
+            enable_nsfw=bool(enable_nsfw),
+            cleanup_interval=int(cleanup_interval),
+            max_slot_retry=int(max_slot_retry),
+            max_mail_retry=int(max_mail_retry),
+        )
+    workers = max(1, min(int(worker_count or 1), int(settings.count), 10))
+    if workers <= 1:
+        return run_batch(
+            count=settings.count,
+            callbacks=callbacks,
+            observer=observer,
+            ops=ops,
+            enable_nsfw=settings.enable_nsfw,
+            cleanup_interval=settings.cleanup_interval,
+            max_slot_retry=settings.max_slot_retry,
+            max_mail_retry=settings.max_mail_retry,
+            settings=settings,
+        )
+
+    result = BatchResult()
+    result_lock = threading.Lock()
+    task_queue = queue.Queue()
+    for index in range(1, settings.count + 1):
+        task_queue.put(index)
+    start_interval = max(0.0, float(thread_start_interval or 0))
+
+    def _merge_account(account, output):
+        with result_lock:
+            result.results.append({"registration": account, "output": output})
+            result.processed_count += 1
+            if output and output.saved:
+                result.success_count += 1
+            else:
+                result.fail_count += 1
+                if account and account.ok:
+                    result.registered_unsaved_count += 1
+            pool_warning = False
+            cpa_warning = False
+            if output:
+                pool_warning = any(
+                    isinstance(state, dict) and state.get("enabled") and not state.get("ok")
+                    for state in output.pools.values()
+                )
+                cpa_warning = bool(
+                    output.cpa
+                    and not output.cpa.get("skipped")
+                    and (
+                        not output.cpa.get("ok")
+                        or output.cpa.get("warning")
+                        or output.cpa.get("cpa_copy_error")
+                        or output.cpa.get("remote_upload_error")
+                    )
+                )
+            if pool_warning or cpa_warning:
+                result.postprocess_warning_count += 1
+            _notify_observer(observer, result, account, output, callbacks)
+
+    def _worker(worker_id):
+        prefix = f"[T{worker_id}]"
+
+        def wlog(message):
+            callbacks.log(f"{prefix} {message}")
+
+        worker_callbacks = RegistrationCallbacks(log=wlog, cancelled=callbacks.cancelled)
+        retry_count_for_slot = 0
+        try:
+            ops.start_browser()
+            wlog("浏览器已启动")
+            while True:
+                if callbacks.cancelled():
+                    with result_lock:
+                        result.cancelled = True
+                    break
+                try:
+                    index = task_queue.get_nowait()
+                except queue.Empty:
+                    break
+                wlog(f"--- 开始第 {index}/{settings.count} 个账号 ---")
+                account = None
+                output = None
+                try:
+                    account = register_one_account(
+                        worker_callbacks,
+                        ops,
+                        enable_nsfw=settings.enable_nsfw,
+                        max_mail_retry=settings.max_mail_retry,
+                    )
+                    output = persist_account_result(account, worker_callbacks, ops)
+                    retry_count_for_slot = 0
+                    if output.saved:
+                        wlog(f"[+] 注册并保存成功: {account.email}")
+                    else:
+                        wlog(f"[-] 注册成功但持久化未完成: {account.email}")
+                    _merge_account(account, output)
+                except ops.cancelled_exception:
+                    with result_lock:
+                        result.cancelled = True
+                    wlog("[!] 注册被停止")
+                    break
+                except ops.retry_exception as exc:
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= settings.max_slot_retry:
+                        wlog(
+                            f"[!] 当前账号流程卡住，重试第 {retry_count_for_slot}/{settings.max_slot_retry} 次: {exc}"
+                        )
+                        task_queue.put(index)
+                    else:
+                        retry_count_for_slot = 0
+                        wlog(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
+                        with result_lock:
+                            result.fail_count += 1
+                            result.processed_count += 1
+                            _notify_observer(observer, result, None, None, callbacks)
+                except Exception as exc:
+                    retry_count_for_slot = 0
+                    wlog(f"[-] 注册失败: {exc}")
+                    with result_lock:
+                        result.fail_count += 1
+                        result.processed_count += 1
+                        _notify_observer(observer, result, None, None, callbacks)
+                if callbacks.cancelled():
+                    with result_lock:
+                        result.cancelled = True
+                    break
+                if not task_queue.empty():
+                    try:
+                        if ops.browser_missing():
+                            ops.start_browser()
+                        else:
+                            ops.restart_browser()
+                        ops.sleep(1)
+                    except ops.cancelled_exception:
+                        with result_lock:
+                            result.cancelled = True
+                        break
+                    except Exception as exc:
+                        wlog(f"[!] 账号间浏览器准备失败: {exc}")
+                        break
+        finally:
+            # Release only this thread's Chromium; global shutdown happens later.
+            try:
+                from registration_browser import stop_browser
+
+                stop_browser()
+            except Exception:
+                pass
+
+    threads = []
+    callbacks.log(f"[*] 多线程模式启动：目标 {settings.count}，并发 {workers}")
+    for worker_id in range(1, workers + 1):
+        thread = threading.Thread(
+            target=_worker,
+            args=(worker_id,),
+            daemon=True,
+            name=f"reg-{worker_id}",
+        )
+        thread.start()
+        threads.append(thread)
+        if worker_id < workers and start_interval > 0:
+            time.sleep(start_interval)
+    try:
+        for thread in threads:
+            thread.join()
     finally:
         _run_cleanup_safely(ops, callbacks, "任务结束")
     return result

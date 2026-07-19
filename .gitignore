@@ -14,6 +14,9 @@ mail_credentials.txt
 
 config.json
 config.local.json
+token.json
+token.json.bak
+token.json.lock
 
 *.log
 .DS_Store
