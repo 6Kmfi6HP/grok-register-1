@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TabPool — per-thread Chromium with proper lifecycle.
+"""TabPool — per-thread CloakBrowser with proper lifecycle.
 
 Interface:
     TabPool.init(options_factory) → save options factory (no browser yet)
@@ -9,7 +9,7 @@ Interface:
     TabPool.shutdown()            → quit all known browsers
 
 Notes:
-    - One Chromium per worker thread (cookie isolation).
+    - One browser per worker thread (cookie isolation).
     - Prefer clear_session() between accounts; release_tab() only on errors / GC.
     - _all_browsers is pruned on release to avoid zombie list growth.
 """
@@ -21,7 +21,7 @@ from typing import Any
 
 
 class TabPool:
-    """Per-thread Chromium instance manager."""
+    """Per-thread CloakBrowser instance manager."""
 
     _options_factory = None
     _options_lock = threading.Lock()
@@ -38,21 +38,21 @@ class TabPool:
             if callable(browser_options_or_factory):
                 cls._options_factory = browser_options_or_factory
             else:
-                # Shared options object: auto_port will NOT re-allocate.
+                # Shared options object: do not share mutable launch state across threads.
                 cls._options_factory = lambda: browser_options_or_factory
         if log_callback:
             log_callback("[*] TabPool 已初始化浏览器选项模板")
 
     @classmethod
     def _create_browser(cls):
-        from DrissionPage import Chromium
+        from browser_runtime import launch_browser_from_options
 
         with cls._options_lock:
             factory = cls._options_factory
         if factory is None:
             return None
         options = factory()
-        browser = Chromium(options)
+        browser = launch_browser_from_options(options)
         with cls._all_browsers_lock:
             cls._all_browsers.append(browser)
         return browser
@@ -69,7 +69,7 @@ class TabPool:
 
     @classmethod
     def get_tab(cls, url=None):
-        """Return current thread tab; create Chromium on first use."""
+        """Return current thread tab; create browser on first use."""
         tab = getattr(cls._thread_local, "tab", None)
         if tab is not None:
             return tab
@@ -84,6 +84,11 @@ class TabPool:
         cls._thread_local.browser = browser
         cls._thread_local.tab = tab
         cls._thread_local.served = 0
+        if url:
+            try:
+                tab.get(url)
+            except Exception:
+                pass
         return tab
 
     @classmethod
@@ -98,7 +103,7 @@ class TabPool:
 
     @classmethod
     def clear_session(cls, log_callback=None) -> bool:
-        """Clear cookies/storage and blank the page; keep Chromium process.
+        """Clear cookies/storage and blank the page; keep browser process.
 
         Returns True if session was cleared on a live browser; False if no browser.
         """
@@ -122,7 +127,6 @@ class TabPool:
                         tab.run_js(js)
                     except Exception:
                         pass
-            # Best-effort cookie wipe (API varies by DrissionPage version)
             cleared = False
             for target in (tab, browser):
                 if target is None or cleared:
@@ -143,12 +147,11 @@ class TabPool:
                         continue
             if not cleared:
                 try:
-                    # Fallback: drop all cookies via CDP-ish helper if present
                     cks = browser.cookies()
                     if isinstance(cks, list):
                         for c in cks:
                             try:
-                                browser.set.cookies.remove(c)  # type: ignore[attr-defined]
+                                browser.set.cookies.remove(c)
                             except Exception:
                                 pass
                 except Exception:
@@ -189,7 +192,7 @@ class TabPool:
 
     @classmethod
     def release_tab(cls):
-        """Quit current thread Chromium and unregister it."""
+        """Quit current thread browser and unregister it."""
         browser = getattr(cls._thread_local, "browser", None)
         if browser is not None:
             try:

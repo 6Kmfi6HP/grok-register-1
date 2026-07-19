@@ -7,10 +7,9 @@ import struct
 import threading
 import time
 
-from DrissionPage import Chromium
-from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
 
+from browser_adapter import PageDisconnectedError
 from tab_pool import TabPool
 
 browser = None

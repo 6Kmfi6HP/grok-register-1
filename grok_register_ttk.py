@@ -38,9 +38,9 @@ import traceback
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
-from DrissionPage import Chromium, ChromiumOptions
-from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
+
+from browser_adapter import PageDisconnectedError
 
 import functools
 import types

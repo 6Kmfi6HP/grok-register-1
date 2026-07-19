@@ -1,8 +1,8 @@
-"""提供共享的 HTTP 请求、代理处理和 Chromium 启动参数。"""
+"""提供共享的 HTTP 请求、代理处理和 CloakBrowser 启动参数。"""
 import os
+import threading
 import urllib.parse
 
-from DrissionPage import ChromiumOptions
 from curl_cffi import requests
 from cpa_xai.proxyutil import (
     LocalAuthProxyBridge,
@@ -12,6 +12,9 @@ from cpa_xai.proxyutil import (
 
 _config = {}
 _extension_path = ""
+# Playwright Sync: one driver root per thread. Track the active adapter so CPA
+# mint can supersede the registration browser on the same worker thread.
+_thread_browser = threading.local()
 
 
 def configure_runtime(config_ref, extension_path=""):
@@ -120,12 +123,99 @@ def prepare_browser_proxy(use_proxy=True, log_callback=None):
     if _proxy_has_auth(proxy) and parsed and (parsed.scheme or "http").lower() not in ("http", "https"):
         stripped = _strip_proxy_auth(proxy)
         if log_callback:
-            log_callback("[!] Chromium 暂不直接支持该认证代理协议，已使用去认证代理地址，失败将回退直连")
+            log_callback("[!] 浏览器暂不直接支持该认证代理协议，已使用去认证代理地址，失败将回退直连")
         return stripped, None
     logger = None
     if log_callback:
-        logger = lambda message: log_callback("[*] 已为 Chromium启动本地认证代理桥: %s" % message.split(": ", 1)[-1]) if "started authenticated proxy bridge" in message else log_callback(message)
+        logger = lambda message: log_callback("[*] 已为浏览器启动本地认证代理桥: %s" % message.split(": ", 1)[-1]) if "started authenticated proxy bridge" in message else log_callback(message)
     return prepare_chromium_proxy(proxy, log=logger)
+
+
+class BrowserLaunchOptions:
+    """Launch config consumed by ``launch_browser_from_options``.
+
+    Keeps a small ChromiumOptions-like surface (headless/set_argument/add_extension)
+    so call sites and tests can still shape options without DrissionPage.
+    """
+
+    def __init__(
+        self,
+        browser_proxy="",
+        extension_path="",
+        headless=False,
+        humanize=True,
+        geoip=None,
+        args=None,
+    ):
+        self.browser_proxy = str(browser_proxy or "").strip()
+        self.extension_path = str(extension_path or "").strip()
+        self._headless = bool(headless)
+        self.humanize = bool(humanize)
+        # None → enable geoip automatically when a proxy is present
+        self.geoip = geoip
+        self.args = list(args or [])
+        self.extra_kwargs = {}
+
+    def headless(self, enabled=True):
+        self._headless = bool(enabled)
+        return self
+
+    def is_headless(self) -> bool:
+        return bool(self._headless)
+
+    def set_argument(self, *parts):
+        if not parts:
+            return self
+        if len(parts) == 1:
+            flag = str(parts[0])
+        elif str(parts[0]).endswith("="):
+            flag = "%s%s" % (parts[0], parts[1])
+        else:
+            flag = "%s=%s" % (parts[0], parts[1])
+        if flag and flag not in self.args:
+            self.args.append(flag)
+        return self
+
+    def add_extension(self, path):
+        path = str(path or "").strip()
+        if path:
+            self.extension_path = path
+        return self
+
+    def set_proxy(self, proxy):
+        self.browser_proxy = str(proxy or "").strip()
+        return self
+
+    def auto_port(self):
+        return self
+
+    def set_timeouts(self, **_kwargs):
+        return self
+
+    def set_browser_path(self, _path):
+        return self
+
+    def to_launch_kwargs(self) -> dict:
+        proxy = self.browser_proxy
+        geoip = self.geoip
+        if geoip is None:
+            geoip = bool(proxy)
+        kwargs = {
+            "headless": bool(self._headless),
+            "humanize": bool(self.humanize),
+            "geoip": bool(geoip) if proxy else False,
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        extensions = []
+        if self.extension_path and os.path.exists(self.extension_path):
+            extensions.append(self.extension_path)
+        if extensions:
+            kwargs["extension_paths"] = extensions
+        if self.args:
+            kwargs["args"] = list(self.args)
+        kwargs.update(self.extra_kwargs)
+        return kwargs
 
 
 def apply_browser_proxy_option(options, proxy):
@@ -137,23 +227,123 @@ def apply_browser_proxy_option(options, proxy):
             return
         except Exception:
             pass
-    if not hasattr(options, "set_argument"):
-        raise AttributeError("当前 DrissionPage ChromiumOptions 不支持设置浏览器代理")
-    try:
-        options.set_argument("--proxy-server=%s" % proxy)
-    except TypeError:
-        options.set_argument("--proxy-server", proxy)
+    if hasattr(options, "set_argument"):
+        try:
+            options.set_argument("--proxy-server=%s" % proxy)
+            return
+        except TypeError:
+            options.set_argument("--proxy-server", proxy)
+            return
+    raise AttributeError("当前浏览器 options 不支持设置代理")
 
 
 def create_browser_options(browser_proxy="", extension_path=None):
-    options = ChromiumOptions()
-    options.auto_port()
-    options.set_timeouts(base=1)
-    apply_browser_proxy_option(options, browser_proxy)
+    """Build launch options for CloakBrowser (anti-detect defaults on)."""
     effective_extension = _extension_path if extension_path is None else str(extension_path or "")
-    if effective_extension and os.path.exists(effective_extension):
-        options.add_extension(effective_extension)
+    options = BrowserLaunchOptions(
+        browser_proxy=browser_proxy or "",
+        extension_path=effective_extension,
+        headless=False,
+        humanize=True,
+        geoip=None,
+    )
+    # Keep proxy on the options object (also used when launching without re-apply)
+    if browser_proxy:
+        apply_browser_proxy_option(options, browser_proxy)
     return options
+
+
+def _release_thread_playwright_owners():
+    """Playwright Sync API allows only one driver per thread.
+
+    CPA mint launches a second browser while registration TabPool still holds the
+    first → 'Sync API inside the asyncio loop'. Drop the current-thread owner so
+    a new CloakBrowser root can start. Safe after SSO is already captured.
+    """
+    active = getattr(_thread_browser, "browser", None)
+    if active is not None:
+        try:
+            active.quit()
+        except Exception:
+            pass
+        _thread_browser.browser = None
+    try:
+        from tab_pool import TabPool
+
+        if TabPool.get_browser() is not None:
+            TabPool.release_tab()
+    except Exception:
+        pass
+    try:
+        import registration_browser as rb
+
+        if getattr(rb, "browser", None) is not None or getattr(rb, "page", None) is not None:
+            rb.browser = None
+            rb.page = None
+    except Exception:
+        pass
+
+
+def launch_browser_from_options(options=None, **overrides):
+    """Launch CloakBrowser and return a BrowserAdapter (DrissionPage-shaped)."""
+    from cloakbrowser import launch
+    from browser_adapter import BrowserAdapter
+
+    if options is None:
+        options = create_browser_options()
+    if isinstance(options, BrowserLaunchOptions):
+        launch_kwargs = options.to_launch_kwargs()
+    elif isinstance(options, dict):
+        launch_kwargs = dict(options)
+    else:
+        # Unknown object: try to read common attributes
+        launch_kwargs = BrowserLaunchOptions(
+            browser_proxy=str(getattr(options, "browser_proxy", "") or ""),
+            extension_path=str(getattr(options, "extension_path", "") or ""),
+            headless=bool(getattr(options, "_headless", False)),
+            humanize=bool(getattr(options, "humanize", True)),
+        ).to_launch_kwargs()
+    launch_kwargs.update(overrides)
+    # Anti-detect: humanize on by default unless caller disables it.
+    launch_kwargs.setdefault("humanize", True)
+    launch_kwargs.setdefault("headless", False)
+    proxy = launch_kwargs.get("proxy") or ""
+    if proxy and "geoip" not in overrides:
+        launch_kwargs.setdefault("geoip", True)
+
+    def _launch_once():
+        pw_browser = launch(**launch_kwargs)
+        context = pw_browser.new_context()
+        adapter = BrowserAdapter(pw_browser, context=context)
+        _thread_browser.browser = adapter
+        return adapter
+
+    # Preemptively free any same-thread Playwright owner (registration → CPA mint).
+    if getattr(_thread_browser, "browser", None) is not None or _tab_pool_has_browser():
+        _release_thread_playwright_owners()
+
+    try:
+        return _launch_once()
+    except Exception as exc:
+        message = str(exc or "")
+        nested = (
+            "asyncio loop" in message
+            or "Sync API" in message
+            or "another synchronous" in message.lower()
+        )
+        if not nested:
+            raise
+        _release_thread_playwright_owners()
+        return _launch_once()
+
+
+def _tab_pool_has_browser() -> bool:
+    try:
+        from tab_pool import TabPool
+
+        return TabPool.get_browser() is not None
+    except Exception:
+        return False
 
 
 def _build_request_kwargs(**kwargs):

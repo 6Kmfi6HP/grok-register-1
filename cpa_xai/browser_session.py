@@ -1,7 +1,6 @@
 """管理 CPA 授权浏览器会话、代理、Cookie 注入和资源清理。"""
 from __future__ import annotations
 
-import os
 import threading
 import time
 from pathlib import Path
@@ -23,70 +22,17 @@ def _sleep(sec: float) -> None:
 
 def create_standalone_page(proxy: Optional[str] = None, headless: bool = False, log: Optional[LogFn] = None):
     logger = log or _noop_log
-    try:
-        from DrissionPage import Chromium, ChromiumOptions
-    except ImportError as exc:
-        raise BrowserConfirmError("DrissionPage not installed") from exc
-
-    options = None
     package_root = Path(__file__).resolve().parents[1]
+
     try:
-        from browser_runtime import create_browser_options
+        from browser_runtime import create_browser_options, launch_browser_from_options
+    except ImportError as exc:
+        raise BrowserConfirmError("browser_runtime not available") from exc
 
-        options = create_browser_options(
-            extension_path=package_root / "turnstilePatch"
-        )
-        logger("using shared browser_runtime.create_browser_options")
-    except Exception as exc:  # noqa: BLE001
-        logger("shared browser options unavailable: %s" % exc)
-        options = None
-
-    if options is None:
-        options = ChromiumOptions()
-        options.auto_port()
-        options.set_timeouts(base=2)
-        for flag in (
-            "--disable-gpu",
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--mute-audio",
-            "--no-first-run",
-            "--disable-background-networking",
-            "--window-size=1280,900",
-        ):
-            options.set_argument(flag)
-        extension = str(package_root / "turnstilePatch")
-        if os.path.isdir(extension):
-            try:
-                options.add_extension(extension)
-                logger("added extension %s" % extension)
-            except Exception as exc:  # noqa: BLE001
-                logger("extension add failed: %s" % exc)
-
-    if headless:
-        try:
-            options.headless(True)
-        except Exception:
-            options.set_argument("--headless=new")
-        logger("headless=True (may hit Cloudflare / break real clicks)")
-    else:
-        try:
-            options.headless(False)
-        except Exception:
-            pass
-
-    for candidate in (
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-    ):
-        if os.path.isfile(candidate):
-            try:
-                options.set_browser_path(candidate)
-            except Exception:
-                pass
-            break
+    try:
+        from cloakbrowser import launch  # noqa: F401
+    except ImportError as exc:
+        raise BrowserConfirmError("cloakbrowser not installed") from exc
 
     from .proxyutil import prepare_chromium_proxy, proxy_log_label, resolve_proxy
 
@@ -94,18 +40,48 @@ def create_standalone_page(proxy: Optional[str] = None, headless: bool = False, 
     proxy_bridge = None
     browser = None
     chrome_proxy, proxy_bridge = prepare_chromium_proxy(resolved, log=logger)
+
+    extension = package_root / "turnstilePatch"
+    try:
+        options = create_browser_options(
+            browser_proxy=chrome_proxy or "",
+            extension_path=extension if extension.is_dir() else "",
+        )
+        options.headless(bool(headless))
+        options.humanize = True
+        # geoip when proxy present (create_browser_options / launch defaults handle this)
+        logger("using shared browser_runtime.create_browser_options + CloakBrowser")
+    except Exception as exc:  # noqa: BLE001
+        logger("shared browser options unavailable: %s" % exc)
+        options = None
+
+    if headless:
+        logger("headless=True (may hit Cloudflare / break real clicks)")
+
     try:
         if chrome_proxy:
-            options.set_argument("--proxy-server=%s" % chrome_proxy)
-            logger("browser proxy=%s (chromium %s)" % (proxy_log_label(resolved), chrome_proxy))
+            logger("browser proxy=%s (cloak %s)" % (proxy_log_label(resolved), chrome_proxy))
         else:
             logger("browser proxy=(none)")
-        browser = Chromium(options)
+
+        if options is None:
+            from browser_runtime import BrowserLaunchOptions, launch_browser_from_options as _launch
+
+            options = BrowserLaunchOptions(
+                browser_proxy=chrome_proxy or "",
+                extension_path=str(extension) if extension.is_dir() else "",
+                headless=bool(headless),
+                humanize=True,
+            )
+            browser = _launch(options)
+        else:
+            browser = launch_browser_from_options(options)
+
         if proxy_bridge is not None:
             setattr(browser, "_cpa_proxy_bridge", proxy_bridge)
         page = browser.latest_tab
         _register_mint_browser(browser)
-        logger("standalone chromium started")
+        logger("standalone cloakbrowser started")
         return browser, page
     except Exception:
         if browser is not None:
@@ -125,7 +101,10 @@ def close_standalone(browser: Any) -> None:
     try:
         browser.quit()
     except Exception:
-        pass
+        try:
+            browser.close()
+        except Exception:
+            pass
     if bridge is not None:
         try:
             bridge.stop()
@@ -348,4 +327,3 @@ def shutdown_mint_browsers() -> None:
         except Exception:
             pass
     state.update({"browser": None, "page": None, "served": 0, "proxy": None, "headless": None})
-
