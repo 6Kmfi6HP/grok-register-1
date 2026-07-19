@@ -103,9 +103,11 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 | 资源名 | 平台 | 说明 |
 | --- | --- | --- |
 | `grok-register-vX.Y.Z-windows-x64.zip` | Windows x64 | **主分发**；解压即用 |
+| `grok-register-vX.Y.Z-macos-arm64.zip` | macOS Apple Silicon (M 系列) | CI 构建；未代码签名 |
+| `grok-register-vX.Y.Z-macos-x64.zip` | macOS Intel | CI 构建；未代码签名 |
 | `grok-register-vX.Y.Z-linux-x64.zip` | Linux x64 | 可选；视 CI 是否成功构建 |
 
-macOS 预构建暂未作为稳定目标；如需可从源码运行或本地打包。
+可用 `uname -m` 判断本机架构：`arm64` 选 macOS arm64，`x86_64` 选 macOS x64。
 
 ### Windows（推荐）
 
@@ -123,6 +125,36 @@ grok-register.exe --version
 grok-register.exe cli
 grok-register.exe start 5
 grok-register.exe retry-pending accounts_20260101_120000.txt.pending.jsonl
+```
+
+### macOS
+
+1. 安装 [Google Chrome](https://www.google.com/chrome/) 或 Chromium。
+2. 按芯片下载对应 zip（M 系列 → `macos-arm64`，Intel → `macos-x64`）并解压。
+3. 复制配置：
+
+```bash
+cp config.example.json config.json
+# 然后编辑 config.json
+```
+
+4. 若首次打开被 Gatekeeper 拦截（未签名软件），在终端进入解压目录后执行：
+
+```bash
+xattr -dr com.apple.quarantine .
+chmod +x grok-register run-gui.sh run-cli.sh 2>/dev/null || true
+```
+
+也可在 Finder 中对 `grok-register` **右键 → 打开**。
+
+5. 启动：
+
+```bash
+./grok-register            # GUI
+./run-gui.sh               # 同上
+./grok-register --help
+./grok-register cli
+./grok-register start 5
 ```
 
 ### 配置与数据位置（打包版）
